@@ -501,23 +501,85 @@ async def login_and_save_state(page):
     logger.info("🌐 Opening login page...")
     await page.goto(LOGIN_URL, wait_until="networkidle")
     await page.wait_for_timeout(2000)
+
+    # (Optional) Debug: save HTML
+    # with open("login_page.html", "w", encoding="utf-8") as f:
+    #     f.write(await page.content())
+
     logger.info("✍️ Filling credentials...")
-    await page.locator("input[type='text']").first.fill(USERNAME)
-    await page.locator("input[type='password']").fill(PASSWORD)
+
+    # Username input – try various selectors
+    username_input = await page.query_selector('input[type="text"]')
+    if not username_input:
+        username_input = await page.query_selector('input[name="username"]')
+    if not username_input:
+        raise Exception("Username input not found")
+    await username_input.fill(USERNAME)
+
+    # Password input
+    password_input = await page.query_selector('input[type="password"]')
+    if not password_input:
+        password_input = await page.query_selector('input[name="password"]')
+    if not password_input:
+        raise Exception("Password input not found")
+    await password_input.fill(PASSWORD)
+
     logger.info("🧩 Solving captcha...")
-    captcha_text = await page.locator("body").inner_text()
-    answer = solve_captcha(captcha_text)
-    if answer is None:
-        raise Exception("Captcha not found")
-    logger.info(f"✅ Captcha: {answer}")
-    await page.locator("input").last.fill(str(answer))
+    # Get page text
+    body_text = await page.locator("body").inner_text()
+    logger.info(f"Page text snippet: {body_text[:200]}...")
+
+    # Try to find "What is X + Y = ?" pattern
+    match = re.search(r"What is\s*(\d+)\s*\+\s*(\d+)\s*=\s*\?", body_text, re.IGNORECASE)
+    if not match:
+        match = re.search(r"(\d+)\s*\+\s*(\d+)\s*=\s*\?", body_text)
+    if not match:
+        match = re.search(r"(\d+)\s*\+\s*(\d+)", body_text)
+    if not match:
+        raise Exception("Captcha question not found")
+
+    a, b = int(match.group(1)), int(match.group(2))
+    answer = a + b
+    logger.info(f"✅ Captcha: {a} + {b} = {answer}")
+
+    # Captcha answer input – try name="captcha", name="answer", or the last input
+    captcha_input = await page.query_selector('input[name="captcha"]')
+    if not captcha_input:
+        captcha_input = await page.query_selector('input[name="answer"]')
+    if not captcha_input:
+        inputs = await page.query_selector_all('input')
+        if inputs:
+            # The last input is usually the captcha field
+            captcha_input = inputs[-1]
+    if captcha_input:
+        await captcha_input.fill(str(answer))
+        logger.info("✅ Captcha answer filled")
+    else:
+        raise Exception("Captcha input field not found")
+
     logger.info("🚀 Clicking login...")
-    await page.locator("button").click()
+    # Login button – try text "LOGIN", submit type, or first button
+    login_button = await page.query_selector('button:has-text("LOGIN")')
+    if not login_button:
+        login_button = await page.query_selector('input[type="submit"]')
+    if not login_button:
+        buttons = await page.query_selector_all('button')
+        if buttons:
+            login_button = buttons[0]
+        else:
+            raise Exception("Login button not found")
+    await login_button.click()
     await page.wait_for_timeout(5000)
-    if "login" in page.url.lower():
-        raise Exception("Login failed")
+
+    # Verify login success
+    current_url = page.url
+    logger.info(f"After login, URL: {current_url}")
+    if "login" in current_url.lower():
+        # await page.screenshot(path="login_failed.png")
+        raise Exception("Login failed – still on login page")
+
     await page.context.storage_state(path=COOKIE_FILE)
-    logger.info("🍪 Cookies saved")
+    logger.info("🍪 Cookies saved successfully")
 
 async def create_context(browser):
     if os.path.exists(COOKIE_FILE):
@@ -765,22 +827,21 @@ async def monitor_loop(application):
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
     )
-    context = await create_context(browser)
-    context = await ensure_logged_in(context, browser)
-
+    context = None
     while True:
         try:
+            if context is None:
+                context = await create_context(browser)
             context = await ensure_logged_in(context, browser)
             data = await scrape_sms_stats(context)
             if data is None:
-                logger.error("Scraping failed, retrying in 1s...")
-                await asyncio.sleep(1)
+                logger.error("Scraping failed, retrying in 5s...")
+                await asyncio.sleep(5)
                 continue
             new_count = 0
             for entry in data:
                 if is_duplicate(entry["id"]):
                     continue
-                # Save to database
                 save_message(
                     entry["id"],
                     entry["number"],
@@ -791,7 +852,6 @@ async def monitor_loop(application):
                     entry["date"],
                     entry["sms"]
                 )
-                # Append to JSON log
                 append_to_json_log({
                     "id": entry["id"],
                     "number": entry["number"],
@@ -810,8 +870,9 @@ async def monitor_loop(application):
                 logger.debug("No new OTPs.")
         except Exception as e:
             logger.error(f"Monitor loop error: {e}")
-            await asyncio.sleep(1)
-        await asyncio.sleep(1)   # 1 second refresh
+            context = None  # reset context to force re-login
+            await asyncio.sleep(5)
+        await asyncio.sleep(1)
 
 # ================= TELEGRAM HANDLERS (Admin Panel) =================
 def admin_only(func):
