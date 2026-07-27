@@ -13,27 +13,39 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
-# ================= FOLDER SETUP =================
-DATA_FOLDER = "IOS_PANEL_DATA"
+# ================= LOGGING =================
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ================= FOLDER =================
+DATA_FOLDER = "ISM_PANEL_DATA"
 if not os.path.exists(DATA_FOLDER):
     os.makedirs(DATA_FOLDER)
 
 COOKIE_FILE = os.path.join(DATA_FOLDER, "cookies.json")
 DB_FILE = os.path.join(DATA_FOLDER, "otp.db")
-JSON_LOG_FILE = os.path.join(DATA_FOLDER, "otp_log.json")
+JSON_FILE = os.path.join(DATA_FOLDER, "otp_log.json")
 
 # ================= CONFIG =================
 BOT_TOKEN = "8858891566:AAEsH_FfBNTkz5b2g814vxKVxwcO8kOm5AU"
-ADMIN_IDS = [8744359777]  # only these users can use admin commands
+ADMIN_IDS = [8744359777]
 
 LOGIN_URL = "http://51.75.131.196/ints/login"
-STATS_URL = "http://51.75.131.196/ints/client/SMSCDRStats"
-USERNAME = "otp_work"
-PASSWORD = "otp_work"
+STATS_URL = "http://51.75.131.196/ints/agent/SMSCDRReports"
+USERNAME = "rakesh1"
+PASSWORD = "rakesh1"
 
-API_PORT = 8000
+API_PORT = 5000
+REFRESH_INTERVAL = 1  # seconds
 
-# ================= ALL COUNTRIES MAP (complete) =================
+# ================= FULL COUNTRY MAP =================
 COUNTRY_CODE_MAP = {
     "1": ("US", "🇺🇸", "USA"),
     "7": ("RU", "🇷🇺", "RUSSIA"),
@@ -206,20 +218,27 @@ COUNTRY_CODE_MAP = {
     "998": ("UZ", "🇺🇿", "UZBEKISTAN"),
 }
 
-ISO_TO_INFO = {v[0]: (v[1], v[2]) for v in COUNTRY_CODE_MAP.values()}
+ISO_TO_INFO = {}
+for code, val in COUNTRY_CODE_MAP.items():
+    if len(val) >= 3:
+        iso, flag, name = val[0], val[1], val[2]
+        ISO_TO_INFO[iso] = (flag, name)
+
 NAME_TO_ISO = {}
-for code, (iso, flag, name) in COUNTRY_CODE_MAP.items():
-    NAME_TO_ISO[name.lower()] = iso
-    # Add short names for common ones
-    if name.lower() == "united kingdom":
-        NAME_TO_ISO["uk"] = "GB"
-        NAME_TO_ISO["gb"] = "GB"
-    elif name.lower() == "united states":
-        NAME_TO_ISO["us"] = "US"
-    elif name.lower() == "united arab emirates":
-        NAME_TO_ISO["uae"] = "AE"
-    elif name.lower() == "south korea":
-        NAME_TO_ISO["kr"] = "KR"
+for code, val in COUNTRY_CODE_MAP.items():
+    if len(val) >= 3:
+        iso = val[0]
+        name = val[2].lower()
+        NAME_TO_ISO[name] = iso
+        if name == "united kingdom":
+            NAME_TO_ISO["uk"] = "GB"
+            NAME_TO_ISO["gb"] = "GB"
+        elif name == "united states":
+            NAME_TO_ISO["us"] = "US"
+        elif name == "united arab emirates":
+            NAME_TO_ISO["uae"] = "AE"
+        elif name == "south korea":
+            NAME_TO_ISO["kr"] = "KR"
 
 def get_country_code(country_name):
     if not country_name:
@@ -227,19 +246,11 @@ def get_country_code(country_name):
     lower = country_name.lower()
     if lower in NAME_TO_ISO:
         return NAME_TO_ISO[lower]
-    # Try without spaces/hyphens
     clean = re.sub(r'[^a-zA-Z]', '', lower)
     for key in NAME_TO_ISO:
         if clean in key or key in clean:
             return NAME_TO_ISO[key]
     return ""
-
-# ================= LOGGING =================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
 # ================= DATABASE =================
 def get_db():
@@ -276,7 +287,6 @@ def init_db():
         is_active INTEGER DEFAULT 1
     )''')
     conn.commit()
-    # Test token
     c.execute("SELECT token FROM api_tokens WHERE token='test_token_123'")
     if not c.fetchone():
         expiry = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
@@ -284,7 +294,7 @@ def init_db():
             "INSERT INTO api_tokens (token, name, created_by, created_at, expires_at, is_active) VALUES (?,?,?,?,?,1)",
             ("test_token_123", "TestToken", ADMIN_IDS[0], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expiry)
         )
-        logger.info("✅ Test token created.")
+        logger.info("Test token created.")
     conn.commit()
     conn.close()
 
@@ -292,7 +302,9 @@ def is_duplicate(msg_id):
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT id FROM messages WHERE id=?", (msg_id,))
-    return c.fetchone() is not None
+    exists = c.fetchone() is not None
+    conn.close()
+    return exists
 
 def save_message(msg_id, number, otp, service, country, country_code, timestamp, full_message):
     conn = get_db()
@@ -317,7 +329,7 @@ def get_otps_by_number(number, limit=50):
     conn.close()
     return [dict(row) for row in rows]
 
-def get_all_otps(limit=25):
+def get_all_otps(limit=50):
     conn = get_db()
     c = conn.cursor()
     c.execute(
@@ -407,23 +419,21 @@ def get_inactive_count():
     c.execute("SELECT COUNT(*) FROM api_tokens WHERE is_active=0 OR expires_at <= datetime('now')")
     return c.fetchone()[0]
 
-# ================= JSON LOGGING =================
+# ================= JSON LOG =================
 def append_to_json_log(entry):
-    """Append a new OTP entry to the JSON log file."""
     try:
-        if os.path.exists(JSON_LOG_FILE):
-            with open(JSON_LOG_FILE, 'r', encoding='utf-8') as f:
+        if os.path.exists(JSON_FILE):
+            with open(JSON_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         else:
             data = []
-        # Ensure data is a list
         if not isinstance(data, list):
             data = []
         data.append(entry)
-        with open(JSON_LOG_FILE, 'w', encoding='utf-8') as f:
+        with open(JSON_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"Failed to write to JSON log: {e}")
+        logger.error(f"JSON write failed: {e}")
 
 # ================= OTP EXTRACTION =================
 def extract_otp_from_sms(sms_text):
@@ -431,7 +441,7 @@ def extract_otp_from_sms(sms_text):
         return None
     text = ' '.join(sms_text.split())
     patterns = [
-        (r'(?:code|otp|pin|verification|auth|one[- ]time|password)\s*[:;.]?\s*(?:is\s*)?#?\s*(\d{4,8})', None),
+        (r'(?:code|otp|pin|verification|auth|security code|one[- ]time|password)\s*(?:is\s*)?[:;.]?\s*#?\s*(\d{4,8})', None),
         (r'#(\d{4,8})\b', None),
         (r'(\d{3})[-—\s](\d{3})', 6),
         (r'(\d{2})[-—\s](\d{3})', 5),
@@ -472,13 +482,13 @@ def detect_service_from_sms(msg):
         "Amazon": [r'amazon'],
         "Uber": [r'uber'],
         "Bolt": [r'bolt'],
-        "Casushi": [r'casushi'],
         "PayPal": [r'paypal'],
         "Binance": [r'binance'],
         "Netflix": [r'netflix'],
-        "Twitter": [r'twitter'],
-        "Discord": [r'discord'],
-        "Snapchat": [r'snapchat'],
+        "Amex": [r'amex'],
+        "KUICK": [r'kuick'],
+        "Telkom": [r'telkom'],
+        "ISM": [r'ism'],
     }
     for srv, pats in patterns.items():
         for p in pats:
@@ -486,117 +496,62 @@ def detect_service_from_sms(msg):
                 return srv
     return "UNKNOWN"
 
-def format_number(number):
-    clean = number.replace('+', '').replace(' ', '').strip()
-    if len(clean) < 9:
-        return clean, ''
-    return clean[:5], clean[-4:]
-
 # ================= PLAYWRIGHT LOGIN & SCRAPE =================
-def solve_captcha(text):
-    match = re.search(r"(\d+)\s*\+\s*(\d+)", text)
-    return int(match.group(1)) + int(match.group(2)) if match else None
-
 async def login_and_save_state(page):
-    logger.info("🌐 Opening login page...")
+    logger.info("Opening login page...")
     await page.goto(LOGIN_URL, wait_until="networkidle")
     await page.wait_for_timeout(2000)
 
-    # (Optional) Debug: save HTML
-    # with open("login_page.html", "w", encoding="utf-8") as f:
-    #     f.write(await page.content())
+    logger.info("Filling credentials...")
+    await page.locator("input[type='text']").first.fill(USERNAME)
+    await page.locator("input[type='password']").fill(PASSWORD)
 
-    logger.info("✍️ Filling credentials...")
-
-    # Username input – try various selectors
-    username_input = await page.query_selector('input[type="text"]')
-    if not username_input:
-        username_input = await page.query_selector('input[name="username"]')
-    if not username_input:
-        raise Exception("Username input not found")
-    await username_input.fill(USERNAME)
-
-    # Password input
-    password_input = await page.query_selector('input[type="password"]')
-    if not password_input:
-        password_input = await page.query_selector('input[name="password"]')
-    if not password_input:
-        raise Exception("Password input not found")
-    await password_input.fill(PASSWORD)
-
-    logger.info("🧩 Solving captcha...")
-    # Get page text
-    body_text = await page.locator("body").inner_text()
-    logger.info(f"Page text snippet: {body_text[:200]}...")
-
-    # Try to find "What is X + Y = ?" pattern
-    match = re.search(r"What is\s*(\d+)\s*\+\s*(\d+)\s*=\s*\?", body_text, re.IGNORECASE)
+    logger.info("Solving captcha...")
+    captcha_text = await page.locator("body").inner_text()
+    match = re.search(r"(\d+)\s*\+\s*(\d+)", captcha_text)
     if not match:
-        match = re.search(r"(\d+)\s*\+\s*(\d+)\s*=\s*\?", body_text)
-    if not match:
-        match = re.search(r"(\d+)\s*\+\s*(\d+)", body_text)
-    if not match:
-        raise Exception("Captcha question not found")
+        raise Exception("Captcha not found")
+    answer = int(match.group(1)) + int(match.group(2))
+    logger.info(f"Captcha answer: {answer}")
+    await page.locator("input").last.fill(str(answer))
 
-    a, b = int(match.group(1)), int(match.group(2))
-    answer = a + b
-    logger.info(f"✅ Captcha: {a} + {b} = {answer}")
+    logger.info("Clicking login button...")
+    await page.locator("button").click()
 
-    # Captcha answer input – try name="captcha", name="answer", or the last input
-    captcha_input = await page.query_selector('input[name="captcha"]')
-    if not captcha_input:
-        captcha_input = await page.query_selector('input[name="answer"]')
-    if not captcha_input:
-        inputs = await page.query_selector_all('input')
-        if inputs:
-            # The last input is usually the captcha field
-            captcha_input = inputs[-1]
-    if captcha_input:
-        await captcha_input.fill(str(answer))
-        logger.info("✅ Captcha answer filled")
+    # 🔥 FIX: URL polling instead of wait_for_load_state
+    logger.info("Waiting for login redirect (max 15s)...")
+    for i in range(15):
+        await asyncio.sleep(1)
+        current_url = page.url
+        if "login" not in current_url.lower():
+            logger.info(f"Redirected to: {current_url}")
+            break
     else:
-        raise Exception("Captcha input field not found")
+        raise Exception("Login timeout – still on login page after 15s")
 
-    logger.info("🚀 Clicking login...")
-    # Login button – try text "LOGIN", submit type, or first button
-    login_button = await page.query_selector('button:has-text("LOGIN")')
-    if not login_button:
-        login_button = await page.query_selector('input[type="submit"]')
-    if not login_button:
-        buttons = await page.query_selector_all('button')
-        if buttons:
-            login_button = buttons[0]
-        else:
-            raise Exception("Login button not found")
-    await login_button.click()
-    await page.wait_for_timeout(5000)
-
-    # Verify login success
-    current_url = page.url
-    logger.info(f"After login, URL: {current_url}")
-    if "login" in current_url.lower():
-        # await page.screenshot(path="login_failed.png")
+    # Extra safety check
+    if "login" in page.url.lower():
         raise Exception("Login failed – still on login page")
 
+    logger.info("Login successful!")
     await page.context.storage_state(path=COOKIE_FILE)
-    logger.info("🍪 Cookies saved successfully")
+    logger.info("Cookies saved.")
 
 async def create_context(browser):
     if os.path.exists(COOKIE_FILE):
-        logger.info("🍪 Loading saved session...")
+        logger.info("Loading saved session...")
         return await browser.new_context(storage_state=COOKIE_FILE)
     else:
-        logger.info("🔑 No session – fresh context.")
+        logger.info("Creating fresh context...")
         return await browser.new_context()
 
 async def ensure_logged_in(context, browser):
     page = await context.new_page()
     try:
-        logger.info("🔍 Checking session on SMS page...")
         await page.goto(STATS_URL, wait_until="domcontentloaded", timeout=15000)
         await page.wait_for_timeout(3000)
         if "login" in page.url.lower():
-            logger.warning("⚠️ Session expired – re‑logging in...")
+            logger.warning("Session expired – re‑logging in...")
             await context.close()
             new_context = await browser.new_context()
             new_page = await new_context.new_page()
@@ -604,22 +559,15 @@ async def ensure_logged_in(context, browser):
             await new_page.close()
             return await browser.new_context(storage_state=COOKIE_FILE)
         else:
-            logger.info("✅ Session valid.")
+            logger.info("Session valid.")
             return context
     finally:
         await page.close()
 
-async def scrape_sms_stats(context):
-    page = await context.new_page()
+async def scrape_sms_stats_from_page(page):
+    """Scrape data from the current page after navigation"""
     try:
-        logger.info("📊 Navigating to SMS CDR Stats...")
-        await page.goto(STATS_URL, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(3000)
-        if "login" in page.url.lower():
-            logger.error("❌ Redirected to login.")
-            return None
-
-        logger.info("⏳ Waiting for AJAX data...")
+        logger.info("Waiting for AJAX data (max 45s)...")
         await page.wait_for_function(
             """() => {
                 const rows = document.querySelectorAll('table.dataTable tbody tr');
@@ -631,54 +579,65 @@ async def scrape_sms_stats(context):
                 }
                 return false;
             }""",
-            timeout=30000
+            timeout=45000
         )
-        logger.info("✅ AJAX data loaded.")
-        html = await page.content()
-        soup = BeautifulSoup(html, 'html.parser')
-        table = soup.select_one('table.dataTable tbody')
-        if not table:
-            logger.error("❌ Table body not found.")
-            return []
+        logger.info("AJAX data loaded.")
+    except Exception as e:
+        logger.warning(f"Timeout waiting for AJAX, but will try to parse anyway: {e}")
 
-        rows = table.find_all('tr')
-        logger.info(f"📊 Found {len(rows)} rows.")
-        results = []
-        for row in rows:
-            cols = row.find_all('td')
-            if len(cols) < 7:
-                continue
-            first = cols[0].get_text(strip=True)
-            if re.match(r'^[\d,]+$', first):
-                continue
-            date = cols[0].get_text(strip=True)
-            range_val = cols[1].get_text(strip=True)
-            number = cols[2].get_text(strip=True)
-            cli = cols[3].get_text(strip=True)
-            sms = cols[4].get_text(strip=True)
-            # Extract country from range
-            country_raw = range_val.split('_')[0] if range_val else ""
-            country_code = get_country_code(country_raw)
-            if country_raw:
-                logger.info(f"🌍 Detected country: {country_raw} -> ISO: {country_code}")
-            otp = extract_otp_from_sms(sms)
-            if not otp:
-                continue
-            service = cli.strip() if cli and cli.strip() and cli.upper() not in ["UNKNOWN", "SERVICE", ""] else detect_service_from_sms(sms)
-            msg_id = f"{date}_{number}_{otp}"
-            results.append({
-                "id": msg_id,
-                "date": date,
-                "country": country_raw,
-                "country_code": country_code,
-                "number": number,
-                "service": service,
-                "sms": sms,
-                "otp": otp
-            })
-        return results
-    finally:
-        await page.close()
+    html = await page.content()
+    soup = BeautifulSoup(html, 'html.parser')
+    table = soup.select_one('table.dataTable tbody')
+    if not table:
+        logger.warning("Table body not found – maybe no data yet.")
+        return []
+
+    rows = table.find_all('tr')
+    logger.info(f"Found {len(rows)} rows.")
+    results = []
+    for row in rows:
+        cols = row.find_all('td')
+        if len(cols) < 9:
+            continue
+        first = cols[0].get_text(strip=True)
+        if re.match(r'^[\d,]+$', first) or "Total" in first:
+            continue
+
+        date = cols[0].get_text(strip=True)
+        range_val = cols[1].get_text(strip=True)
+        number = cols[2].get_text(strip=True)
+        cli = cols[3].get_text(strip=True)
+        client = cols[4].get_text(strip=True)
+        sms = cols[5].get_text(strip=True)
+
+        country = range_val
+        country_code = get_country_code(country)
+
+        otp = extract_otp_from_sms(sms)
+        if not otp:
+            continue
+
+        service = "UNKNOWN"
+        if cli and cli.strip() and cli.upper() not in ["UNKNOWN", "SERVICE", ""]:
+            service = cli.strip()
+        elif client and client.strip() and client.upper() not in ["UNKNOWN", "SERVICE", ""]:
+            service = client.strip().lstrip('#')
+        else:
+            service = detect_service_from_sms(sms)
+
+        msg_id = f"{date}_{number}_{otp}"
+        results.append({
+            "id": msg_id,
+            "date": date,
+            "country": country,
+            "country_code": country_code,
+            "number": number,
+            "service": service,
+            "sms": sms,
+            "otp": otp
+        })
+    logger.info(f"Extracted {len(results)} OTP entries.")
+    return results
 
 # ================= API SERVER =================
 api_app = Flask(__name__)
@@ -687,16 +646,14 @@ api_app = Flask(__name__)
 def get_otp_api():
     token = request.args.get('token')
     number = request.args.get('number')
-    if not token:
-        return jsonify({"status": "error", "error": "missing_token", "message": "Token required"}), 400
-    if not number:
-        return jsonify({"status": "error", "error": "missing_number", "message": "Number required"}), 400
+    if not token or not number:
+        return jsonify({"status": "error", "message": "Token and number required"}), 400
     info = get_token_info(token)
     if not info or info["is_active"] != 1 or info["expires_at"] < datetime.now().strftime("%Y-%m-%d %H:%M:%S"):
-        return jsonify({"status": "error", "error": "invalid_token", "message": "Invalid or expired token"}), 401
+        return jsonify({"status": "error", "error": "invalid_token"}), 401
     otps = get_otps_by_number(number)
     if not otps:
-        return jsonify({"status": "not_found", "data": {"number": number, "total_otps": 0, "otps": []}, "Sms": "No OTPs found"})
+        return jsonify({"status": "not_found", "data": {"number": number, "total_otps": 0, "otps": []}})
     formatted = []
     for o in otps:
         formatted.append({
@@ -707,11 +664,7 @@ def get_otp_api():
             "country_code": o.get("country_code", ""),
             "message": o["full_message"]
         })
-    return jsonify({
-        "status": "success",
-        "data": {"number": number, "total_otps": len(formatted), "otps": formatted},
-        "Sms": f"Found {len(formatted)} OTPs"
-    })
+    return jsonify({"status": "success", "data": {"number": number, "total_otps": len(formatted), "otps": formatted}})
 
 @api_app.route('/latest_otp', methods=['GET'])
 def latest_otp_api():
@@ -721,10 +674,10 @@ def latest_otp_api():
         return jsonify({"status": "error", "message": "Token and number required"}), 400
     info = get_token_info(token)
     if not info or info["is_active"] != 1:
-        return jsonify({"status": "error", "message": "Invalid token"}), 401
+        return jsonify({"status": "error", "error": "invalid_token"}), 401
     otps = get_otps_by_number(number, limit=1)
     if not otps:
-        return jsonify({"status": "not_found", "data": {"number": number, "otp": None}, "Sms": "No OTP found"})
+        return jsonify({"status": "not_found", "data": {"number": number, "otp": None}})
     o = otps[0]
     return jsonify({
         "status": "success",
@@ -736,8 +689,7 @@ def latest_otp_api():
             "country": o["country"],
             "country_code": o.get("country_code", ""),
             "message": o["full_message"]
-        },
-        "Sms": "OTP found successfully"
+        }
     })
 
 @api_app.route('/all_otp', methods=['GET'])
@@ -745,36 +697,39 @@ def all_otp_api():
     token = request.args.get('token')
     if not token:
         return jsonify({"status": "error", "error": "missing_token", "message": "Token required"}), 400
+
     info = get_token_info(token)
     if not info or info["is_active"] != 1 or info["expires_at"] < datetime.now().strftime("%Y-%m-%d %H:%M:%S"):
         return jsonify({"status": "error", "error": "invalid_token", "message": "Invalid or expired token"}), 401
 
     try:
-        rows = get_all_otps(25)
+        rows = get_all_otps(50)
         if not rows:
             return jsonify({
-                "status": "not_found",
-                "data": {"total": 0, "otps": []},
-                "Sms": "No OTPs found"
+                "status": "success",
+                "Sms": "No OTPs found",
+                "data": {"total": 0, "otps": []}
             })
+
         formatted = []
         for row in rows:
             formatted.append({
                 "number": row.get("number", ""),
                 "otp": row.get("otp", ""),
                 "timestamp": row.get("timestamp", ""),
-                "service": row.get("service", ""),
-                "country": row.get("country", ""),
+                "service": row.get("service", "UNKNOWN"),
+                "country": row.get("country", "Unknown"),
                 "country_code": row.get("country_code", ""),
                 "message": row.get("full_message", "")
             })
+
         return jsonify({
             "status": "success",
+            "Sms": f"Found {len(formatted)} recent OTPs",
             "data": {
                 "total": len(formatted),
                 "otps": formatted
-            },
-            "Sms": f"Found {len(formatted)} recent OTPs"
+            }
         })
     except Exception as e:
         logger.error(f"Error in /all_otp: {e}")
@@ -787,7 +742,7 @@ def api_stats():
         return jsonify({"status": "error", "message": "Token required"}), 400
     info = get_token_info(token)
     if not info or info["is_active"] != 1:
-        return jsonify({"status": "error", "message": "Invalid token"}), 401
+        return jsonify({"status": "error", "error": "invalid_token"}), 401
     return jsonify({
         "status": "success",
         "data": {
@@ -801,10 +756,10 @@ def api_stats():
 def check_token_api():
     token = request.args.get('token')
     if not token:
-        return jsonify({"status": "error", "error": "missing_token", "message": "Token required"}), 400
+        return jsonify({"status": "error", "error": "missing_token"}), 400
     info = get_token_info(token)
     if not info:
-        return jsonify({"status": "error", "error": "invalid_token", "message": "Invalid token"}), 401
+        return jsonify({"status": "error", "error": "invalid_token"}), 401
     is_valid = info["is_active"] == 1 and info["expires_at"] > datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return jsonify({
         "status": "success",
@@ -820,24 +775,62 @@ def check_token_api():
 def start_api_server():
     api_app.run(host="0.0.0.0", port=API_PORT, debug=False, use_reloader=False)
 
-# ================= MONITOR LOOP (1 SECOND REFRESH) =================
+# ================= MONITOR LOOP (ROBUST NAVIGATION) =================
 async def monitor_loop(application):
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
     )
-    context = None
+    context = await create_context(browser)
+    context = await ensure_logged_in(context, browser)
+
     while True:
+        page = None
         try:
-            if context is None:
-                context = await create_context(browser)
-            context = await ensure_logged_in(context, browser)
-            data = await scrape_sms_stats(context)
+            page = await context.new_page()
+            logger.info("Navigating to SMSCDR Reports page...")
+            
+            # 🔥 FIX: Try goto with fallback to reload
+            try:
+                await asyncio.wait_for(
+                    page.goto(STATS_URL, wait_until="domcontentloaded"),
+                    timeout=25.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Navigation timeout, trying page.reload()...")
+                await page.reload(wait_until="domcontentloaded", timeout=25000)
+
+            await page.wait_for_timeout(3000)
+
+            # AJAX wait
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const rows = document.querySelectorAll('table.dataTable tbody tr');
+                        for (let row of rows) {
+                            const firstCell = row.querySelector('td');
+                            if (firstCell && !firstCell.innerText.trim().match(/^[\\d,]+$/)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }""",
+                    timeout=45000
+                )
+                logger.info("AJAX data loaded.")
+            except Exception as e:
+                logger.warning(f"AJAX timeout, trying to parse anyway: {e}")
+
+            data = await scrape_sms_stats_from_page(page)
+            await page.close()
+            page = None
+
             if data is None:
-                logger.error("Scraping failed, retrying in 5s...")
-                await asyncio.sleep(5)
+                logger.error("Scraping returned None, retrying...")
+                await asyncio.sleep(REFRESH_INTERVAL)
                 continue
+
             new_count = 0
             for entry in data:
                 if is_duplicate(entry["id"]):
@@ -863,18 +856,30 @@ async def monitor_loop(application):
                     "full_message": entry["sms"]
                 })
                 new_count += 1
-                logger.info(f"✅ New OTP stored: {entry['otp']} for {entry['number']}")
+                logger.info(f"New OTP stored: {entry['otp']} for {entry['number']}")
+
             if new_count:
-                logger.info(f"📤 Stored {new_count} new OTPs.")
+                logger.info(f"Total {new_count} new OTPs stored.")
             else:
-                logger.debug("No new OTPs.")
+                logger.debug("No new OTPs found.")
+
         except Exception as e:
             logger.error(f"Monitor loop error: {e}")
-            context = None  # reset context to force re-login
-            await asyncio.sleep(5)
-        await asyncio.sleep(1)
+            if page:
+                try:
+                    await page.close()
+                except:
+                    pass
+            try:
+                await context.close()
+            except:
+                pass
+            context = await create_context(browser)
+            context = await ensure_logged_in(context, browser)
 
-# ================= TELEGRAM HANDLERS (Admin Panel) =================
+        await asyncio.sleep(REFRESH_INTERVAL)
+
+# ================= TELEGRAM HANDLERS (ADMIN ONLY) =================
 def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id not in ADMIN_IDS:
@@ -956,14 +961,12 @@ async def new_token_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def create_token_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     try:
         if query.data.startswith("new_token_"):
             days_map = {"7": 7, "30": 30, "90": 90}
             if query.data in ["new_token_7", "new_token_30", "new_token_90"]:
                 days = days_map[query.data.split("_")[2]]
                 token, created, expires = create_token(f"Token_{datetime.now().strftime('%Y%m%d')}", days)
-
                 msg = (
                     f"✅ <b>New API token created!</b>\n\n"
                     f"ℹ️ Name: <code>Token_{datetime.now().strftime('%Y%m%d')}</code>\n"
@@ -1135,7 +1138,6 @@ async def refresh_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await panel(update, context)
 
-# ---- Ignore non-admin users ----
 async def ignore_non_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
@@ -1143,7 +1145,7 @@ async def ignore_non_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     threading.Thread(target=start_api_server, daemon=True).start()
-    logger.info(f"🌐 API Server running on http://0.0.0.0:{API_PORT}")
+    logger.info(f"API Server running on http://0.0.0.0:{API_PORT}")
 
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -1171,7 +1173,7 @@ def main():
     loop = asyncio.get_event_loop()
     loop.create_task(monitor_loop(application))
 
-    logger.info("🚀 Bot started. Press Ctrl+C to stop.")
+    logger.info("Bot started. Press Ctrl+C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
