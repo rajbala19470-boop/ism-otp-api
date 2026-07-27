@@ -43,7 +43,7 @@ USERNAME = "rakesh1"
 PASSWORD = "rakesh1"
 
 API_PORT = 5000
-REFRESH_INTERVAL = 1  # seconds
+REFRESH_INTERVAL = 3  # seconds
 
 # ================= FULL COUNTRY MAP =================
 COUNTRY_CODE_MAP = {
