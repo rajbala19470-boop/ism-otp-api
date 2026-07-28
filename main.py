@@ -13,15 +13,16 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
-# ================= LOGGING (Only Emoji) =================
-# সব লাইব্রেরির লগ চুপ করো
+# ================= LOGGING (Only Emoji - No API Call Log) =================
+# সব লাইব্রেরির লগ চুপ করো (API call log বাদ)
 logging.getLogger("telegram").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
 logging.getLogger("apscheduler").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-# শুধু সময় ও মেসেজ (ইমোজি)
+# শুধু সময় ও ইমোজি মেসেজ দেখাবে
 logging.basicConfig(
     format="%(asctime)s - %(message)s",
     level=logging.INFO
@@ -47,7 +48,7 @@ USERNAME = "rakesh1"
 PASSWORD = "rakesh1"
 
 API_PORT = 5000
-REFRESH_INTERVAL = 3  # seconds
+REFRESH_INTERVAL = 2  # seconds
 
 # ================= FULL COUNTRY MAP =================
 COUNTRY_CODE_MAP = {
@@ -522,7 +523,6 @@ async def login_and_save_state(page):
     logger.info("🚀 Clicking login button...")
     await page.locator("button").click()
 
-    # URL polling instead of wait_for_load_state
     logger.info("⏳ Waiting for login redirect (max 15s)...")
     for i in range(15):
         await asyncio.sleep(1)
