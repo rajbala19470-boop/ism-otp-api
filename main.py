@@ -1,6 +1,7 @@
 import asyncio
 import re
 import os
+import sys
 import json
 import sqlite3
 import logging
@@ -45,8 +46,18 @@ STATS_URL = "http://51.75.131.196/ints/agent/SMSCDRReports"
 USERNAME = "rakesh1"
 PASSWORD = "rakesh1"
 
-API_PORT = 5000
+API_PORT = 3070
 REFRESH_INTERVAL = 2  # seconds
+
+# ================= WATCHDOG =================
+last_success_time = datetime.now()
+RESTART_TIMEOUT = 60  # seconds
+
+def restart_script():
+    """Restart the current script."""
+    logger.info("🔄 Restarting script due to inactivity...")
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
 
 # ================= FULL COUNTRY MAP =================
 COUNTRY_CODE_MAP = {
@@ -499,10 +510,15 @@ def detect_service_from_sms(msg):
                 return srv
     return "UNKNOWN"
 
-# ================= PLAYWRIGHT LOGIN & SCRAPE =================
+# ================= PLAYWRIGHT LOGIN & SCRAPE (FIXED for stuck login) =================
 async def login_and_save_state(page):
     logger.info("🌐 Opening login page...")
-    await page.goto(LOGIN_URL, wait_until="networkidle")
+    # Use domcontentloaded instead of networkidle to avoid hanging
+    try:
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+    except Exception as e:
+        logger.warning(f"⏳ Goto timeout, retrying with commit... {e}")
+        await page.goto(LOGIN_URL, wait_until="commit", timeout=30000)
     await page.wait_for_timeout(2000)
 
     logger.info("✍️ Filling credentials...")
@@ -519,7 +535,12 @@ async def login_and_save_state(page):
     await page.locator("input").last.fill(str(answer))
 
     logger.info("🚀 Clicking login button...")
-    await page.locator("button").click()
+    # Click and wait for navigation with a timeout
+    try:
+        async with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+            await page.locator("button").click()
+    except Exception as e:
+        logger.warning(f"⏳ Navigation after click timeout, checking URL... {e}")
 
     logger.info("⏳ Waiting for login redirect (max 15s)...")
     for i in range(15):
@@ -782,6 +803,7 @@ def start_api_server():
 
 # ================= MONITOR LOOP =================
 async def monitor_loop(application):
+    global last_success_time
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
         headless=True,
@@ -801,9 +823,11 @@ async def monitor_loop(application):
                     page.goto(STATS_URL, wait_until="domcontentloaded"),
                     timeout=25.0
                 )
+                last_success_time = datetime.now()  # ✅ Navigation success
             except asyncio.TimeoutError:
                 logger.warning("⏳ Navigation timeout, trying page.reload()...")
                 await page.reload(wait_until="domcontentloaded", timeout=25000)
+                last_success_time = datetime.now()  # ✅ Reload success
 
             await page.wait_for_timeout(3000)
 
@@ -815,6 +839,9 @@ async def monitor_loop(application):
                 logger.error("❌ Scraping returned None, retrying...")
                 await asyncio.sleep(REFRESH_INTERVAL)
                 continue
+
+            # Data received – update watchdog
+            last_success_time = datetime.now()
 
             new_count = 0
             for entry in data:
@@ -863,6 +890,15 @@ async def monitor_loop(application):
             context = await ensure_logged_in(context, browser)
 
         await asyncio.sleep(REFRESH_INTERVAL)
+
+# ================= WATCHDOG TASK =================
+async def watchdog_task():
+    global last_success_time
+    while True:
+        await asyncio.sleep(10)  # check every 10 seconds
+        if (datetime.now() - last_success_time).total_seconds() > RESTART_TIMEOUT:
+            logger.error(f"❌ No successful activity for {RESTART_TIMEOUT} seconds! Restarting...")
+            restart_script()
 
 # ================= TELEGRAM HANDLERS =================
 def admin_only(func):
@@ -1156,6 +1192,7 @@ def main():
     application.add_handler(MessageHandler(filters.ALL, ignore_non_admin), group=1)
 
     loop = asyncio.get_event_loop()
+    loop.create_task(watchdog_task())          # Start watchdog
     loop.create_task(monitor_loop(application))
 
     logger.info("🚀 Bot started. Press Ctrl+C to stop.")
