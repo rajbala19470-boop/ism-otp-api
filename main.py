@@ -46,7 +46,7 @@ STATS_URL = "http://51.75.131.196/ints/agent/SMSCDRReports"
 USERNAME = "rakesh1"
 PASSWORD = "rakesh1"
 
-API_PORT = 3070
+API_PORT = 9998
 REFRESH_INTERVAL = 2  # seconds
 
 # ================= WATCHDOG =================
