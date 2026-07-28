@@ -541,7 +541,12 @@ async def login_and_save_state(page):
 async def create_context(browser):
     if os.path.exists(COOKIE_FILE):
         logger.info("🍪 Loading saved session...")
-        return await browser.new_context(storage_state=COOKIE_FILE)
+        try:
+            return await browser.new_context(storage_state=COOKIE_FILE)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load cookies: {e}, removing and retrying...")
+            os.remove(COOKIE_FILE)
+            return await browser.new_context()
     else:
         logger.info("🔑 Creating fresh context...")
         return await browser.new_context()
@@ -549,7 +554,18 @@ async def create_context(browser):
 async def ensure_logged_in(context, browser):
     page = await context.new_page()
     try:
-        await page.goto(STATS_URL, wait_until="domcontentloaded", timeout=15000)
+        logger.info("🔍 Checking session...")
+        try:
+            await asyncio.wait_for(
+                page.goto(STATS_URL, wait_until="domcontentloaded"),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("⏳ Goto timeout, trying again...")
+            await page.close()
+            page = await context.new_page()
+            await page.goto(STATS_URL, wait_until="domcontentloaded", timeout=30000)
+
         await page.wait_for_timeout(3000)
         if "login" in page.url.lower():
             logger.warning("⚠️ Session expired – re‑logging in...")
@@ -785,7 +801,14 @@ async def monitor_loop(application):
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-setuid-sandbox",
+            "--disable-accelerated-2d-canvas",
+            "--disable-pdf-viewer"
+        ]
     )
     context = await create_context(browser)
     context = await ensure_logged_in(context, browser)
@@ -859,6 +882,9 @@ async def monitor_loop(application):
                 await context.close()
             except:
                 pass
+            # Delete old cookie to force fresh login
+            if os.path.exists(COOKIE_FILE):
+                os.remove(COOKIE_FILE)
             context = await create_context(browser)
             context = await ensure_logged_in(context, browser)
 
