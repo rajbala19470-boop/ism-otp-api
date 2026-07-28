@@ -13,13 +13,17 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
-# ================= LOGGING =================
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("apscheduler").setLevel(logging.WARNING)
+# ================= LOGGING (Only Emoji) =================
+# সব লাইব্রেরির লগ চুপ করো
+logging.getLogger("telegram").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("httpcore").setLevel(logging.ERROR)
+logging.getLogger("apscheduler").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
+# শুধু সময় ও মেসেজ (ইমোজি)
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
@@ -294,7 +298,7 @@ def init_db():
             "INSERT INTO api_tokens (token, name, created_by, created_at, expires_at, is_active) VALUES (?,?,?,?,?,1)",
             ("test_token_123", "TestToken", ADMIN_IDS[0], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expiry)
         )
-        logger.info("Test token created.")
+        logger.info("🔑 Test token created.")
     conn.commit()
     conn.close()
 
@@ -433,7 +437,7 @@ def append_to_json_log(entry):
         with open(JSON_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"JSON write failed: {e}")
+        logger.error(f"❌ JSON write failed: {e}")
 
 # ================= OTP EXTRACTION =================
 def extract_otp_from_sms(sms_text):
@@ -498,51 +502,50 @@ def detect_service_from_sms(msg):
 
 # ================= PLAYWRIGHT LOGIN & SCRAPE =================
 async def login_and_save_state(page):
-    logger.info("Opening login page...")
+    logger.info("🌐 Opening login page...")
     await page.goto(LOGIN_URL, wait_until="networkidle")
     await page.wait_for_timeout(2000)
 
-    logger.info("Filling credentials...")
+    logger.info("✍️ Filling credentials...")
     await page.locator("input[type='text']").first.fill(USERNAME)
     await page.locator("input[type='password']").fill(PASSWORD)
 
-    logger.info("Solving captcha...")
+    logger.info("🧩 Solving captcha...")
     captcha_text = await page.locator("body").inner_text()
     match = re.search(r"(\d+)\s*\+\s*(\d+)", captcha_text)
     if not match:
-        raise Exception("Captcha not found")
+        raise Exception("❌ Captcha not found")
     answer = int(match.group(1)) + int(match.group(2))
-    logger.info(f"Captcha answer: {answer}")
+    logger.info(f"✅ Captcha answer: {answer}")
     await page.locator("input").last.fill(str(answer))
 
-    logger.info("Clicking login button...")
+    logger.info("🚀 Clicking login button...")
     await page.locator("button").click()
 
-    # 🔥 FIX: URL polling instead of wait_for_load_state
-    logger.info("Waiting for login redirect (max 15s)...")
+    # URL polling instead of wait_for_load_state
+    logger.info("⏳ Waiting for login redirect (max 15s)...")
     for i in range(15):
         await asyncio.sleep(1)
         current_url = page.url
         if "login" not in current_url.lower():
-            logger.info(f"Redirected to: {current_url}")
+            logger.info(f"✅ Redirected to: {current_url}")
             break
     else:
-        raise Exception("Login timeout – still on login page after 15s")
+        raise Exception("❌ Login timeout – still on login page after 15s")
 
-    # Extra safety check
     if "login" in page.url.lower():
-        raise Exception("Login failed – still on login page")
+        raise Exception("❌ Login failed – still on login page")
 
-    logger.info("Login successful!")
+    logger.info("✅ Login successful!")
     await page.context.storage_state(path=COOKIE_FILE)
-    logger.info("Cookies saved.")
+    logger.info("🍪 Cookies saved.")
 
 async def create_context(browser):
     if os.path.exists(COOKIE_FILE):
-        logger.info("Loading saved session...")
+        logger.info("🍪 Loading saved session...")
         return await browser.new_context(storage_state=COOKIE_FILE)
     else:
-        logger.info("Creating fresh context...")
+        logger.info("🔑 Creating fresh context...")
         return await browser.new_context()
 
 async def ensure_logged_in(context, browser):
@@ -551,7 +554,7 @@ async def ensure_logged_in(context, browser):
         await page.goto(STATS_URL, wait_until="domcontentloaded", timeout=15000)
         await page.wait_for_timeout(3000)
         if "login" in page.url.lower():
-            logger.warning("Session expired – re‑logging in...")
+            logger.warning("⚠️ Session expired – re‑logging in...")
             await context.close()
             new_context = await browser.new_context()
             new_page = await new_context.new_page()
@@ -559,15 +562,14 @@ async def ensure_logged_in(context, browser):
             await new_page.close()
             return await browser.new_context(storage_state=COOKIE_FILE)
         else:
-            logger.info("Session valid.")
+            logger.info("✅ Session valid.")
             return context
     finally:
         await page.close()
 
 async def scrape_sms_stats_from_page(page):
-    """Scrape data from the current page after navigation"""
     try:
-        logger.info("Waiting for AJAX data (max 45s)...")
+        logger.info("⏳ Waiting for AJAX data (max 45s)...")
         await page.wait_for_function(
             """() => {
                 const rows = document.querySelectorAll('table.dataTable tbody tr');
@@ -581,19 +583,19 @@ async def scrape_sms_stats_from_page(page):
             }""",
             timeout=45000
         )
-        logger.info("AJAX data loaded.")
+        logger.info("✅ AJAX data loaded.")
     except Exception as e:
-        logger.warning(f"Timeout waiting for AJAX, but will try to parse anyway: {e}")
+        logger.warning(f"⏳ AJAX timeout, trying to parse anyway: {e}")
 
     html = await page.content()
     soup = BeautifulSoup(html, 'html.parser')
     table = soup.select_one('table.dataTable tbody')
     if not table:
-        logger.warning("Table body not found – maybe no data yet.")
+        logger.warning("⚠️ Table body not found – maybe no data yet.")
         return []
 
     rows = table.find_all('tr')
-    logger.info(f"Found {len(rows)} rows.")
+    logger.info(f"📊 Found {len(rows)} rows.")
     results = []
     for row in rows:
         cols = row.find_all('td')
@@ -636,7 +638,7 @@ async def scrape_sms_stats_from_page(page):
             "sms": sms,
             "otp": otp
         })
-    logger.info(f"Extracted {len(results)} OTP entries.")
+    logger.info(f"✅ Extracted {len(results)} OTP entries.")
     return results
 
 # ================= API SERVER =================
@@ -732,7 +734,7 @@ def all_otp_api():
             }
         })
     except Exception as e:
-        logger.error(f"Error in /all_otp: {e}")
+        logger.error(f"❌ Error in /all_otp: {e}")
         return jsonify({"status": "error", "error": "internal_error", "message": str(e)}), 500
 
 @api_app.route('/stats', methods=['GET'])
@@ -775,7 +777,7 @@ def check_token_api():
 def start_api_server():
     api_app.run(host="0.0.0.0", port=API_PORT, debug=False, use_reloader=False)
 
-# ================= MONITOR LOOP (ROBUST NAVIGATION) =================
+# ================= MONITOR LOOP =================
 async def monitor_loop(application):
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
@@ -789,45 +791,25 @@ async def monitor_loop(application):
         page = None
         try:
             page = await context.new_page()
-            logger.info("Navigating to SMSCDR Reports page...")
-            
-            # 🔥 FIX: Try goto with fallback to reload
+            logger.info("📊 Navigating to SMSCDR Reports page...")
+
             try:
                 await asyncio.wait_for(
                     page.goto(STATS_URL, wait_until="domcontentloaded"),
                     timeout=25.0
                 )
             except asyncio.TimeoutError:
-                logger.warning("Navigation timeout, trying page.reload()...")
+                logger.warning("⏳ Navigation timeout, trying page.reload()...")
                 await page.reload(wait_until="domcontentloaded", timeout=25000)
 
             await page.wait_for_timeout(3000)
-
-            # AJAX wait
-            try:
-                await page.wait_for_function(
-                    """() => {
-                        const rows = document.querySelectorAll('table.dataTable tbody tr');
-                        for (let row of rows) {
-                            const firstCell = row.querySelector('td');
-                            if (firstCell && !firstCell.innerText.trim().match(/^[\\d,]+$/)) {
-                                return true;
-                            }
-                        }
-                        return false;
-                    }""",
-                    timeout=45000
-                )
-                logger.info("AJAX data loaded.")
-            except Exception as e:
-                logger.warning(f"AJAX timeout, trying to parse anyway: {e}")
 
             data = await scrape_sms_stats_from_page(page)
             await page.close()
             page = None
 
             if data is None:
-                logger.error("Scraping returned None, retrying...")
+                logger.error("❌ Scraping returned None, retrying...")
                 await asyncio.sleep(REFRESH_INTERVAL)
                 continue
 
@@ -856,15 +838,15 @@ async def monitor_loop(application):
                     "full_message": entry["sms"]
                 })
                 new_count += 1
-                logger.info(f"New OTP stored: {entry['otp']} for {entry['number']}")
+                logger.info(f"💾 New OTP stored: {entry['otp']} for {entry['number']}")
 
             if new_count:
-                logger.info(f"Total {new_count} new OTPs stored.")
+                logger.info(f"📤 Total {new_count} new OTPs stored.")
             else:
-                logger.debug("No new OTPs found.")
+                logger.debug("🔄 No new OTPs found.")
 
         except Exception as e:
-            logger.error(f"Monitor loop error: {e}")
+            logger.error(f"❌ Monitor loop error: {e}")
             if page:
                 try:
                     await page.close()
@@ -988,7 +970,7 @@ async def create_token_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="panel")]]
                 await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     except Exception as e:
-        logger.error(f"Error in create_token_callback: {e}")
+        logger.error(f"❌ Error in create_token_callback: {e}")
         await query.message.reply_text("❌ Failed to create token. Please try again.", parse_mode="HTML")
 
 @admin_only
@@ -1145,7 +1127,7 @@ async def ignore_non_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     threading.Thread(target=start_api_server, daemon=True).start()
-    logger.info(f"API Server running on http://0.0.0.0:{API_PORT}")
+    logger.info("🌐 API Server running on http://0.0.0.0:5000")
 
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -1173,7 +1155,7 @@ def main():
     loop = asyncio.get_event_loop()
     loop.create_task(monitor_loop(application))
 
-    logger.info("Bot started. Press Ctrl+C to stop.")
+    logger.info("🚀 Bot started. Press Ctrl+C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
