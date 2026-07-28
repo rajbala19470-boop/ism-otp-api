@@ -14,7 +14,6 @@ from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
 # ================= LOGGING (Only Emoji - No API Call Log) =================
-# সব লাইব্রেরির লগ চুপ করো (API call log বাদ)
 logging.getLogger("telegram").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
@@ -22,7 +21,6 @@ logging.getLogger("apscheduler").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-# শুধু সময় ও ইমোজি মেসেজ দেখাবে
 logging.basicConfig(
     format="%(asctime)s - %(message)s",
     level=logging.INFO
@@ -567,25 +565,30 @@ async def ensure_logged_in(context, browser):
     finally:
         await page.close()
 
+# ================= IMPROVED: WAIT FOR DATA ROWS (DATE PATTERN) =================
 async def scrape_sms_stats_from_page(page):
     try:
-        logger.info("⏳ Waiting for AJAX data (max 45s)...")
+        logger.info("⏳ Waiting for data rows (max 10s)...")
         await page.wait_for_function(
             """() => {
                 const rows = document.querySelectorAll('table.dataTable tbody tr');
                 for (let row of rows) {
                     const firstCell = row.querySelector('td');
-                    if (firstCell && !firstCell.innerText.trim().match(/^[\\d,]+$/)) {
-                        return true;
+                    if (firstCell) {
+                        const text = firstCell.innerText.trim();
+                        if (/^\\d{4}-\\d{2}-\\d{2}/.test(text)) {
+                            return true;
+                        }
                     }
                 }
                 return false;
             }""",
-            timeout=45000
+            timeout=10000,
+            polling=200
         )
-        logger.info("✅ AJAX data loaded.")
+        logger.info("✅ Data rows loaded.")
     except Exception as e:
-        logger.warning(f"⏳ AJAX timeout, trying to parse anyway: {e}")
+        logger.warning(f"⏳ Data rows not found within timeout, trying to parse anyway: {e}")
 
     html = await page.content()
     soup = BeautifulSoup(html, 'html.parser')
@@ -861,7 +864,7 @@ async def monitor_loop(application):
 
         await asyncio.sleep(REFRESH_INTERVAL)
 
-# ================= TELEGRAM HANDLERS (ADMIN ONLY) =================
+# ================= TELEGRAM HANDLERS =================
 def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id not in ADMIN_IDS:
