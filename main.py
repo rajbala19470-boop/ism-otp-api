@@ -8,7 +8,6 @@ import threading
 import secrets
 import sys
 import time
-import signal
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,14 +15,13 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
-# ================= SELF-RESTART MECHANISM =================
+# ================= SELF-RESTART =================
 def restart_bot():
-    """Restart the current script using os.execl."""
     logger.info("🔄 Restarting bot...")
     time.sleep(2)
     os.execl(sys.executable, sys.executable, *sys.argv)
 
-# ================= LOGGING (Only Emoji - No API Call Log) =================
+# ================= LOGGING =================
 logging.getLogger("telegram").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
@@ -59,10 +57,10 @@ USERNAME = "rakesh1"
 PASSWORD = "rakesh1"
 
 API_PORT = 5000
-REFRESH_INTERVAL = 2  # seconds
-TIMEOUT_SECONDS = 45  # max time allowed for one full cycle (navigation + scraping)
+REFRESH_INTERVAL = 2
+TIMEOUT_SECONDS = 45
 
-# ================= FULL COUNTRY MAP =================
+# ================= COUNTRY MAP =================
 COUNTRY_CODE_MAP = {
     "1": ("US", "🇺🇸", "USA"),
     "7": ("RU", "🇷🇺", "RUSSIA"),
@@ -452,7 +450,7 @@ def append_to_json_log(entry):
     except Exception as e:
         logger.error(f"❌ JSON write failed: {e}")
 
-# ================= OTP EXTRACTION =================
+# ================= OTP EXTRACTION (ULTRA ROBUST) =================
 def extract_otp_from_sms(sms_text):
     if not sms_text:
         return None
@@ -484,6 +482,13 @@ def extract_otp_from_sms(sms_text):
                     digits = match.group(1) if match.groups() else match.group(0)
                     if digits.isdigit():
                         return digits
+    # Fallback: just find any 6-digit number
+    fallback = re.search(r'\b(\d{6})\b', text)
+    if fallback:
+        return fallback.group(1)
+    fallback4 = re.search(r'\b(\d{4})\b', text)
+    if fallback4:
+        return fallback4.group(1)
     return None
 
 def detect_service_from_sms(msg):
@@ -513,7 +518,7 @@ def detect_service_from_sms(msg):
                 return srv
     return "UNKNOWN"
 
-# ================= PLAYWRIGHT LOGIN & SCRAPE =================
+# ================= LOGIN FUNCTIONS =================
 async def login_and_save_state(page):
     logger.info("🌐 Opening login page...")
     await page.goto(LOGIN_URL, wait_until="networkidle")
@@ -580,7 +585,6 @@ async def ensure_logged_in(context, browser):
                     return context
             except:
                 continue
-        # If all URLs fail, re-login
         logger.warning("⚠️ Session expired – re‑logging in...")
         await context.close()
         new_context = await browser.new_context()
@@ -591,6 +595,7 @@ async def ensure_logged_in(context, browser):
     finally:
         await page.close()
 
+# ================= UPDATED SCRAPE FUNCTION (VERBOSE LOGGING) =================
 async def scrape_sms_stats_from_page(page):
     try:
         logger.info("⏳ Waiting for data rows (max 10s)...")
@@ -625,28 +630,43 @@ async def scrape_sms_stats_from_page(page):
     rows = table.find_all('tr')
     logger.info(f"📊 Found {len(rows)} rows.")
     results = []
-    for row in rows:
+    for idx, row in enumerate(rows):
         cols = row.find_all('td')
-        if len(cols) < 9:
-            continue
-        first = cols[0].get_text(strip=True)
-        if re.match(r'^[\d,]+$', first) or "Total" in first:
+        if len(cols) < 7:
+            logger.debug(f"⏩ Row {idx+1}: only {len(cols)} columns, skipping")
             continue
 
-        date = cols[0].get_text(strip=True)
-        range_val = cols[1].get_text(strip=True)
-        number = cols[2].get_text(strip=True)
-        cli = cols[3].get_text(strip=True)
-        client = cols[4].get_text(strip=True)
-        sms = cols[5].get_text(strip=True)
+        # Check if it's a summary row
+        first = cols[0].get_text(strip=True)
+        if re.match(r'^[\d,]+$', first) or "Total" in first or "Showing" in first:
+            logger.debug(f"⏩ Row {idx+1}: summary row, skipping")
+            continue
+
+        try:
+            date = cols[0].get_text(strip=True)
+            range_val = cols[1].get_text(strip=True)
+            number = cols[2].get_text(strip=True)
+            cli = cols[3].get_text(strip=True)
+            client = cols[4].get_text(strip=True)
+            sms = cols[5].get_text(strip=True) if len(cols) > 5 else ""
+        except IndexError:
+            logger.debug(f"⏩ Row {idx+1}: missing expected columns, skipping")
+            continue
+
+        if not sms:
+            logger.debug(f"⏩ Row {idx+1}: empty SMS, skipping")
+            continue
 
         country = range_val
         country_code = get_country_code(country)
 
+        # Try to extract OTP
         otp = extract_otp_from_sms(sms)
         if not otp:
+            logger.info(f"⚠️ Row {idx+1}: No OTP in SMS: {sms[:80]}...")
             continue
 
+        # Determine service
         service = "UNKNOWN"
         if cli and cli.strip() and cli.upper() not in ["UNKNOWN", "SERVICE", ""]:
             service = cli.strip()
@@ -666,7 +686,9 @@ async def scrape_sms_stats_from_page(page):
             "sms": sms,
             "otp": otp
         })
-    logger.info(f"✅ Extracted {len(results)} OTP entries.")
+        logger.info(f"✅ Row {idx+1}: OTP {otp} for {number} (service: {service})")
+
+    logger.info(f"✅ Extracted {len(results)} OTP entries from {len(rows)} rows.")
     return results
 
 # ================= API SERVER =================
@@ -805,17 +827,12 @@ def check_token_api():
 def start_api_server():
     api_app.run(host="0.0.0.0", port=API_PORT, debug=False, use_reloader=False)
 
-# ================= MONITOR LOOP WITH TIMEOUT & SELF-RESTART =================
+# ================= MONITOR LOOP =================
 async def monitor_loop(application):
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
         headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-setuid-sandbox"
-        ]
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"]
     )
     context = await create_context(browser)
     context = await ensure_logged_in(context, browser)
@@ -823,23 +840,19 @@ async def monitor_loop(application):
 
     while True:
         try:
-            # 전체 사이클에 타임아웃 설정
             await asyncio.wait_for(
                 _cycle(page, context, browser, application),
                 timeout=TIMEOUT_SECONDS
             )
         except asyncio.TimeoutError:
             logger.error(f"❌ Cycle timed out after {TIMEOUT_SECONDS}s – restarting...")
-            raise  # will be caught by outer try and trigger restart
+            raise
         except Exception as e:
             logger.error(f"❌ Monitor loop error: {e}")
-            # যদি কোনো গুরুতর ত্রুটি হয়, রিস্টার্ট ট্রিগার করি
-            raise  # restart
+            raise
 
 async def _cycle(page, context, browser, application):
-    """Single cycle of navigation and scraping."""
     try:
-        # Check if we are on correct page
         current_url = page.url
         if "login" in current_url.lower():
             logger.warning("⚠️ Currently on login page, re-logging...")
@@ -851,7 +864,6 @@ async def _cycle(page, context, browser, application):
             page = await context.new_page()
             return
 
-        # Navigate if not on stats page
         if not any(url in current_url for url in STATS_URLS):
             logger.info("📊 Navigating to SMSCDR Reports page...")
             for url in STATS_URLS:
@@ -867,10 +879,8 @@ async def _cycle(page, context, browser, application):
                     continue
             else:
                 raise Exception("All URLs timed out")
-
             await page.wait_for_timeout(3000)
 
-        # Scrape
         data = await scrape_sms_stats_from_page(page)
         if data is None:
             logger.error("❌ Scraping returned None")
@@ -879,6 +889,7 @@ async def _cycle(page, context, browser, application):
         new_count = 0
         for entry in data:
             if is_duplicate(entry["id"]):
+                logger.debug(f"⏩ Duplicate skipped: {entry['id']}")
                 continue
             save_message(
                 entry["id"],
@@ -910,13 +921,11 @@ async def _cycle(page, context, browser, application):
 
     except Exception as e:
         logger.error(f"❌ Cycle error: {e}")
-        # কোনো ত্রুটি হলে পেজ বন্ধ করে নতুন পেজ তৈরি
         try:
             await page.close()
         except:
             pass
         page = await context.new_page()
-        # যদি কুকি নষ্ট থাকে, ডিলিট করি
         if os.path.exists(COOKIE_FILE):
             try:
                 os.remove(COOKIE_FILE)
@@ -925,7 +934,7 @@ async def _cycle(page, context, browser, application):
         context = await create_context(browser)
         context = await ensure_logged_in(context, browser)
         page = await context.new_page()
-        raise  # propagate to outer loop
+        raise
 
     await asyncio.sleep(REFRESH_INTERVAL)
 
@@ -1191,7 +1200,7 @@ async def refresh_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ignore_non_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
-# ================= MAIN WITH SELF-RESTART =================
+# ================= MAIN =================
 def main():
     init_db()
     threading.Thread(target=start_api_server, daemon=True).start()
@@ -1228,17 +1237,14 @@ def main():
         application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         logger.error(f"❌ Bot crashed: {e}")
-        logger.info("🔄 Restarting bot...")
         restart_bot()
 
 if __name__ == "__main__":
-    # Self-restart loop
     while True:
         try:
             main()
         except Exception as e:
-            logger.error(f"❌ Bot crashed with exception: {e}")
-            logger.info("🔄 Restarting in 5 seconds...")
+            logger.error(f"❌ Bot crashed: {e}")
             time.sleep(5)
             restart_bot()
         else:
