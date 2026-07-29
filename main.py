@@ -6,12 +6,22 @@ import sqlite3
 import logging
 import threading
 import secrets
+import sys
+import time
+import signal
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
+
+# ================= SELF-RESTART MECHANISM =================
+def restart_bot():
+    """Restart the current script using os.execl."""
+    logger.info("🔄 Restarting bot...")
+    time.sleep(2)
+    os.execl(sys.executable, sys.executable, *sys.argv)
 
 # ================= LOGGING (Only Emoji - No API Call Log) =================
 logging.getLogger("telegram").setLevel(logging.ERROR)
@@ -41,12 +51,16 @@ BOT_TOKEN = "8858891566:AAEsH_FfBNTkz5b2g814vxKVxwcO8kOm5AU"
 ADMIN_IDS = [8744359777]
 
 LOGIN_URL = "http://51.75.131.196/ints/login"
-STATS_URL = "http://51.75.131.196/ints/agent/SMSCDRReports"
+STATS_URLS = [
+    "http://51.75.131.196/ints/agent/SMSCDRReports",
+    "http://51.75.131.196/ints/client/SMSCDRStats"
+]
 USERNAME = "rakesh1"
 PASSWORD = "rakesh1"
 
 API_PORT = 5000
 REFRESH_INTERVAL = 2  # seconds
+TIMEOUT_SECONDS = 45  # max time allowed for one full cycle (navigation + scraping)
 
 # ================= FULL COUNTRY MAP =================
 COUNTRY_CODE_MAP = {
@@ -555,33 +569,28 @@ async def ensure_logged_in(context, browser):
     page = await context.new_page()
     try:
         logger.info("🔍 Checking session...")
-        try:
-            await asyncio.wait_for(
-                page.goto(STATS_URL, wait_until="domcontentloaded"),
-                timeout=30.0
-            )
-        except asyncio.TimeoutError:
-            logger.warning("⏳ Goto timeout, trying again...")
-            await page.close()
-            page = await context.new_page()
-            await page.goto(STATS_URL, wait_until="domcontentloaded", timeout=30000)
-
-        await page.wait_for_timeout(3000)
-        if "login" in page.url.lower():
-            logger.warning("⚠️ Session expired – re‑logging in...")
-            await context.close()
-            new_context = await browser.new_context()
-            new_page = await new_context.new_page()
-            await login_and_save_state(new_page)
-            await new_page.close()
-            return await browser.new_context(storage_state=COOKIE_FILE)
-        else:
-            logger.info("✅ Session valid.")
-            return context
+        for url in STATS_URLS:
+            try:
+                await asyncio.wait_for(
+                    page.goto(url, wait_until="domcontentloaded"),
+                    timeout=20.0
+                )
+                if "login" not in page.url.lower():
+                    logger.info("✅ Session valid.")
+                    return context
+            except:
+                continue
+        # If all URLs fail, re-login
+        logger.warning("⚠️ Session expired – re‑logging in...")
+        await context.close()
+        new_context = await browser.new_context()
+        new_page = await new_context.new_page()
+        await login_and_save_state(new_page)
+        await new_page.close()
+        return await browser.new_context(storage_state=COOKIE_FILE)
     finally:
         await page.close()
 
-# ================= IMPROVED: WAIT FOR DATA ROWS (DATE PATTERN) =================
 async def scrape_sms_stats_from_page(page):
     try:
         logger.info("⏳ Waiting for data rows (max 10s)...")
@@ -796,7 +805,7 @@ def check_token_api():
 def start_api_server():
     api_app.run(host="0.0.0.0", port=API_PORT, debug=False, use_reloader=False)
 
-# ================= MONITOR LOOP =================
+# ================= MONITOR LOOP WITH TIMEOUT & SELF-RESTART =================
 async def monitor_loop(application):
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
@@ -805,90 +814,120 @@ async def monitor_loop(application):
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
-            "--disable-setuid-sandbox",
-            "--disable-accelerated-2d-canvas",
-            "--disable-pdf-viewer"
+            "--disable-setuid-sandbox"
         ]
     )
     context = await create_context(browser)
     context = await ensure_logged_in(context, browser)
+    page = await context.new_page()
 
     while True:
-        page = None
         try:
-            page = await context.new_page()
-            logger.info("📊 Navigating to SMSCDR Reports page...")
-
-            try:
-                await asyncio.wait_for(
-                    page.goto(STATS_URL, wait_until="domcontentloaded"),
-                    timeout=25.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning("⏳ Navigation timeout, trying page.reload()...")
-                await page.reload(wait_until="domcontentloaded", timeout=25000)
-
-            await page.wait_for_timeout(3000)
-
-            data = await scrape_sms_stats_from_page(page)
-            await page.close()
-            page = None
-
-            if data is None:
-                logger.error("❌ Scraping returned None, retrying...")
-                await asyncio.sleep(REFRESH_INTERVAL)
-                continue
-
-            new_count = 0
-            for entry in data:
-                if is_duplicate(entry["id"]):
-                    continue
-                save_message(
-                    entry["id"],
-                    entry["number"],
-                    entry["otp"],
-                    entry["service"],
-                    entry["country"],
-                    entry.get("country_code", ""),
-                    entry["date"],
-                    entry["sms"]
-                )
-                append_to_json_log({
-                    "id": entry["id"],
-                    "number": entry["number"],
-                    "otp": entry["otp"],
-                    "service": entry["service"],
-                    "country": entry["country"],
-                    "country_code": entry.get("country_code", ""),
-                    "timestamp": entry["date"],
-                    "full_message": entry["sms"]
-                })
-                new_count += 1
-                logger.info(f"💾 New OTP stored: {entry['otp']} for {entry['number']}")
-
-            if new_count:
-                logger.info(f"📤 Total {new_count} new OTPs stored.")
-            else:
-                logger.debug("🔄 No new OTPs found.")
-
+            # 전체 사이클에 타임아웃 설정
+            await asyncio.wait_for(
+                _cycle(page, context, browser, application),
+                timeout=TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"❌ Cycle timed out after {TIMEOUT_SECONDS}s – restarting...")
+            raise  # will be caught by outer try and trigger restart
         except Exception as e:
             logger.error(f"❌ Monitor loop error: {e}")
-            if page:
-                try:
-                    await page.close()
-                except:
-                    pass
-            try:
-                await context.close()
-            except:
-                pass
-            # Delete old cookie to force fresh login
+            # যদি কোনো গুরুতর ত্রুটি হয়, রিস্টার্ট ট্রিগার করি
+            raise  # restart
+
+async def _cycle(page, context, browser, application):
+    """Single cycle of navigation and scraping."""
+    try:
+        # Check if we are on correct page
+        current_url = page.url
+        if "login" in current_url.lower():
+            logger.warning("⚠️ Currently on login page, re-logging...")
+            await context.close()
             if os.path.exists(COOKIE_FILE):
                 os.remove(COOKIE_FILE)
             context = await create_context(browser)
             context = await ensure_logged_in(context, browser)
+            page = await context.new_page()
+            return
 
-        await asyncio.sleep(REFRESH_INTERVAL)
+        # Navigate if not on stats page
+        if not any(url in current_url for url in STATS_URLS):
+            logger.info("📊 Navigating to SMSCDR Reports page...")
+            for url in STATS_URLS:
+                try:
+                    await asyncio.wait_for(
+                        page.goto(url, wait_until="domcontentloaded"),
+                        timeout=20.0
+                    )
+                    logger.info(f"✅ Navigated to {url}")
+                    break
+                except asyncio.TimeoutError:
+                    logger.warning(f"⏳ Timeout for {url}, trying next...")
+                    continue
+            else:
+                raise Exception("All URLs timed out")
+
+            await page.wait_for_timeout(3000)
+
+        # Scrape
+        data = await scrape_sms_stats_from_page(page)
+        if data is None:
+            logger.error("❌ Scraping returned None")
+            raise Exception("Scraping failed")
+
+        new_count = 0
+        for entry in data:
+            if is_duplicate(entry["id"]):
+                continue
+            save_message(
+                entry["id"],
+                entry["number"],
+                entry["otp"],
+                entry["service"],
+                entry["country"],
+                entry.get("country_code", ""),
+                entry["date"],
+                entry["sms"]
+            )
+            append_to_json_log({
+                "id": entry["id"],
+                "number": entry["number"],
+                "otp": entry["otp"],
+                "service": entry["service"],
+                "country": entry["country"],
+                "country_code": entry.get("country_code", ""),
+                "timestamp": entry["date"],
+                "full_message": entry["sms"]
+            })
+            new_count += 1
+            logger.info(f"💾 New OTP stored: {entry['otp']} for {entry['number']}")
+
+        if new_count:
+            logger.info(f"📤 Total {new_count} new OTPs stored.")
+        else:
+            logger.debug("🔄 No new OTPs found.")
+
+    except Exception as e:
+        logger.error(f"❌ Cycle error: {e}")
+        # কোনো ত্রুটি হলে পেজ বন্ধ করে নতুন পেজ তৈরি
+        try:
+            await page.close()
+        except:
+            pass
+        page = await context.new_page()
+        # যদি কুকি নষ্ট থাকে, ডিলিট করি
+        if os.path.exists(COOKIE_FILE):
+            try:
+                os.remove(COOKIE_FILE)
+            except:
+                pass
+        context = await create_context(browser)
+        context = await ensure_logged_in(context, browser)
+        page = await context.new_page()
+        raise  # propagate to outer loop
+
+    await asyncio.sleep(REFRESH_INTERVAL)
 
 # ================= TELEGRAM HANDLERS =================
 def admin_only(func):
@@ -1152,7 +1191,7 @@ async def refresh_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ignore_non_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
-# ================= MAIN =================
+# ================= MAIN WITH SELF-RESTART =================
 def main():
     init_db()
     threading.Thread(target=start_api_server, daemon=True).start()
@@ -1185,7 +1224,22 @@ def main():
     loop.create_task(monitor_loop(application))
 
     logger.info("🚀 Bot started. Press Ctrl+C to stop.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        logger.error(f"❌ Bot crashed: {e}")
+        logger.info("🔄 Restarting bot...")
+        restart_bot()
 
 if __name__ == "__main__":
-    main()
+    # Self-restart loop
+    while True:
+        try:
+            main()
+        except Exception as e:
+            logger.error(f"❌ Bot crashed with exception: {e}")
+            logger.info("🔄 Restarting in 5 seconds...")
+            time.sleep(5)
+            restart_bot()
+        else:
+            break
