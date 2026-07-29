@@ -595,7 +595,7 @@ async def ensure_logged_in(context, browser):
     finally:
         await page.close()
 
-# ================= UPDATED SCRAPE FUNCTION (VERBOSE LOGGING) =================
+# ================= SCRAPE FUNCTION =================
 async def scrape_sms_stats_from_page(page):
     try:
         logger.info("⏳ Waiting for data rows (max 10s)...")
@@ -864,7 +864,29 @@ async def _cycle(page, context, browser, application):
             page = await context.new_page()
             return
 
-        if not any(url in current_url for url in STATS_URLS):
+        # Always refresh/reload the page to get latest data
+        if any(url in current_url for url in STATS_URLS):
+            logger.info("🔄 Refreshing page to get latest data...")
+            try:
+                await asyncio.wait_for(
+                    page.reload(wait_until="domcontentloaded"),
+                    timeout=20.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⏳ Reload timeout, navigating to URL instead...")
+                # If reload times out, try goto again
+                for url in STATS_URLS:
+                    try:
+                        await asyncio.wait_for(
+                            page.goto(url, wait_until="domcontentloaded"),
+                            timeout=20.0
+                        )
+                        logger.info(f"✅ Navigated to {url}")
+                        break
+                    except:
+                        continue
+        else:
+            # Not on stats page, navigate
             logger.info("📊 Navigating to SMSCDR Reports page...")
             for url in STATS_URLS:
                 try:
@@ -881,6 +903,7 @@ async def _cycle(page, context, browser, application):
                 raise Exception("All URLs timed out")
             await page.wait_for_timeout(3000)
 
+        # Scrape data
         data = await scrape_sms_stats_from_page(page)
         if data is None:
             logger.error("❌ Scraping returned None")
@@ -925,6 +948,7 @@ async def _cycle(page, context, browser, application):
             await page.close()
         except:
             pass
+        # Try to recover by creating new page and context
         page = await context.new_page()
         if os.path.exists(COOKIE_FILE):
             try:
