@@ -7,6 +7,7 @@ import sqlite3
 import logging
 import threading
 import secrets
+import time
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -576,7 +577,7 @@ async def login_and_save_cookie(playwright):
     await browser.close()
     return True
 
-# ================= LOAD STATS =================
+# ================= LOAD STATS (with column detection) =================
 async def load_stats_with_cookie(playwright):
     global last_success_time
     
@@ -618,6 +619,7 @@ async def load_stats_with_cookie(playwright):
             await browser.close()
             return True, []
 
+        # Determine column count from first row
         first_row = rows[0]
         first_cols = first_row.find_all('td')
         col_count = len(first_cols)
@@ -627,6 +629,12 @@ async def load_stats_with_cookie(playwright):
             logger.warning(f"⚠️ Table has only {col_count} columns, expected at least 7")
             await browser.close()
             return False, None
+
+        # Identify SMS column index based on column count
+        # For 9 columns: Date(0), Range(1), Number(2), CLI(3), Client(4), SMS(5), Currency(6), My Payout(7), Client Payout(8)
+        # For 7 columns: Date(0), Range(1), Number(2), CLI(3), SMS(4), Currency(5), My Payout(6)
+        sms_index = 5 if col_count >= 9 else 4
+        logger.info(f"📌 Using SMS column index: {sms_index}")
 
         results = []
         otp_count = 0
@@ -642,7 +650,7 @@ async def load_stats_with_cookie(playwright):
             range_val = cols[1].get_text(strip=True)
             number = cols[2].get_text(strip=True)
             cli = cols[3].get_text(strip=True)
-            sms = cols[4].get_text(strip=True)
+            sms = cols[sms_index].get_text(strip=True) if len(cols) > sms_index else ""
             
             logger.info(f"📝 SMS: {sms[:200]}...")
             
@@ -1179,7 +1187,6 @@ async def ignore_non_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     threading.Thread(target=start_api_server, daemon=True).start()
-    import time
     time.sleep(1)
     logger.info(f"🌐 API Server running on http://{API_HOST}:{API_PORT}")
 
