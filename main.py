@@ -15,12 +15,6 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
-# ================= SELF-RESTART =================
-def restart_bot():
-    logger.info("🔄 Restarting bot...")
-    time.sleep(2)
-    os.execl(sys.executable, sys.executable, *sys.argv)
-
 # ================= LOGGING =================
 logging.getLogger("telegram").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
@@ -57,8 +51,8 @@ USERNAME = "rakesh1"
 PASSWORD = "rakesh1"
 
 API_PORT = 5000
-REFRESH_INTERVAL = 2
-TIMEOUT_SECONDS = 45
+REFRESH_INTERVAL = 3  # seconds
+MAX_RETRIES = 5
 
 # ================= COUNTRY MAP =================
 COUNTRY_CODE_MAP = {
@@ -450,7 +444,7 @@ def append_to_json_log(entry):
     except Exception as e:
         logger.error(f"❌ JSON write failed: {e}")
 
-# ================= OTP EXTRACTION (ULTRA ROBUST) =================
+# ================= OTP EXTRACTION =================
 def extract_otp_from_sms(sms_text):
     if not sms_text:
         return None
@@ -482,7 +476,6 @@ def extract_otp_from_sms(sms_text):
                     digits = match.group(1) if match.groups() else match.group(0)
                     if digits.isdigit():
                         return digits
-    # Fallback: just find any 6-digit number
     fallback = re.search(r'\b(\d{6})\b', text)
     if fallback:
         return fallback.group(1)
@@ -518,7 +511,7 @@ def detect_service_from_sms(msg):
                 return srv
     return "UNKNOWN"
 
-# ================= LOGIN FUNCTIONS =================
+# ================= PLAYWRIGHT FUNCTIONS =================
 async def login_and_save_state(page):
     logger.info("🌐 Opening login page...")
     await page.goto(LOGIN_URL, wait_until="networkidle")
@@ -595,7 +588,6 @@ async def ensure_logged_in(context, browser):
     finally:
         await page.close()
 
-# ================= SCRAPE FUNCTION =================
 async def scrape_sms_stats_from_page(page):
     try:
         logger.info("⏳ Waiting for data rows (max 10s)...")
@@ -633,15 +625,10 @@ async def scrape_sms_stats_from_page(page):
     for idx, row in enumerate(rows):
         cols = row.find_all('td')
         if len(cols) < 7:
-            logger.debug(f"⏩ Row {idx+1}: only {len(cols)} columns, skipping")
             continue
-
-        # Check if it's a summary row
         first = cols[0].get_text(strip=True)
         if re.match(r'^[\d,]+$', first) or "Total" in first or "Showing" in first:
-            logger.debug(f"⏩ Row {idx+1}: summary row, skipping")
             continue
-
         try:
             date = cols[0].get_text(strip=True)
             range_val = cols[1].get_text(strip=True)
@@ -650,23 +637,14 @@ async def scrape_sms_stats_from_page(page):
             client = cols[4].get_text(strip=True)
             sms = cols[5].get_text(strip=True) if len(cols) > 5 else ""
         except IndexError:
-            logger.debug(f"⏩ Row {idx+1}: missing expected columns, skipping")
             continue
-
         if not sms:
-            logger.debug(f"⏩ Row {idx+1}: empty SMS, skipping")
             continue
-
         country = range_val
         country_code = get_country_code(country)
-
-        # Try to extract OTP
         otp = extract_otp_from_sms(sms)
         if not otp:
-            logger.info(f"⚠️ Row {idx+1}: No OTP in SMS: {sms[:80]}...")
             continue
-
-        # Determine service
         service = "UNKNOWN"
         if cli and cli.strip() and cli.upper() not in ["UNKNOWN", "SERVICE", ""]:
             service = cli.strip()
@@ -674,7 +652,6 @@ async def scrape_sms_stats_from_page(page):
             service = client.strip().lstrip('#')
         else:
             service = detect_service_from_sms(sms)
-
         msg_id = f"{date}_{number}_{otp}"
         results.append({
             "id": msg_id,
@@ -687,7 +664,6 @@ async def scrape_sms_stats_from_page(page):
             "otp": otp
         })
         logger.info(f"✅ Row {idx+1}: OTP {otp} for {number} (service: {service})")
-
     logger.info(f"✅ Extracted {len(results)} OTP entries from {len(rows)} rows.")
     return results
 
@@ -749,11 +725,9 @@ def all_otp_api():
     token = request.args.get('token')
     if not token:
         return jsonify({"status": "error", "error": "missing_token", "message": "Token required"}), 400
-
     info = get_token_info(token)
     if not info or info["is_active"] != 1 or info["expires_at"] < datetime.now().strftime("%Y-%m-%d %H:%M:%S"):
         return jsonify({"status": "error", "error": "invalid_token", "message": "Invalid or expired token"}), 401
-
     try:
         rows = get_all_otps(50)
         if not rows:
@@ -762,7 +736,6 @@ def all_otp_api():
                 "Sms": "No OTPs found",
                 "data": {"total": 0, "otps": []}
             })
-
         formatted = []
         for row in rows:
             formatted.append({
@@ -774,7 +747,6 @@ def all_otp_api():
                 "country_code": row.get("country_code", ""),
                 "message": row.get("full_message", "")
             })
-
         return jsonify({
             "status": "success",
             "Sms": f"Found {len(formatted)} recent OTPs",
@@ -827,136 +799,111 @@ def check_token_api():
 def start_api_server():
     api_app.run(host="0.0.0.0", port=API_PORT, debug=False, use_reloader=False)
 
-# ================= MONITOR LOOP =================
-async def monitor_loop(application):
-    try:
-        playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"]
-        )
-        context = await create_context(browser)
-        context = await ensure_logged_in(context, browser)
-        page = await context.new_page()
+# ================= BOT WORKER =================
+bot_running = True
 
-        while True:
-            try:
-                await asyncio.wait_for(
-                    _cycle(page, context, browser, application),
-                    timeout=TIMEOUT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"❌ Cycle timed out after {TIMEOUT_SECONDS}s – restarting...")
-                restart_bot()
-                return  # never reached
-            except Exception as e:
-                logger.error(f"❌ Monitor loop error: {e}")
-                # Try to recover
-                try:
-                    await page.close()
-                except:
-                    pass
-                try:
-                    await context.close()
-                except:
-                    pass
-                if os.path.exists(COOKIE_FILE):
-                    try:
-                        os.remove(COOKIE_FILE)
-                    except:
-                        pass
-                # Recreate context and page
-                context = await create_context(browser)
-                context = await ensure_logged_in(context, browser)
-                page = await context.new_page()
-                await asyncio.sleep(2)
-
-    except Exception as e:
-        logger.error(f"❌ Fatal error in monitor_loop: {e}")
-        restart_bot()
-
-async def _cycle(page, context, browser, application):
-    try:
-        current_url = page.url
-        if "login" in current_url.lower():
-            logger.warning("⚠️ Currently on login page, re-logging...")
-            await context.close()
-            if os.path.exists(COOKIE_FILE):
-                os.remove(COOKIE_FILE)
+async def bot_worker():
+    global bot_running
+    while bot_running:
+        try:
+            logger.info("🚀 Starting bot worker...")
+            playwright = await async_playwright().start()
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"]
+            )
             context = await create_context(browser)
             context = await ensure_logged_in(context, browser)
             page = await context.new_page()
-            return
-
-        # Always navigate to stats page to get fresh data
-        if not any(url in current_url for url in STATS_URLS):
-            logger.info("📊 Navigating to SMSCDR Reports page...")
-        else:
-            logger.info("🔄 Refreshing page to get latest data...")
-
-        # Use goto instead of reload to avoid crashes
-        for url in STATS_URLS:
-            try:
-                await asyncio.wait_for(
-                    page.goto(url, wait_until="domcontentloaded"),
-                    timeout=20.0
-                )
-                logger.info(f"✅ Navigated to {url}")
-                break
-            except asyncio.TimeoutError:
-                logger.warning(f"⏳ Timeout for {url}, trying next...")
-                continue
-        else:
-            raise Exception("All URLs timed out")
-
-        await page.wait_for_timeout(3000)
-
-        # Scrape data
-        data = await scrape_sms_stats_from_page(page)
-        if data is None:
-            logger.error("❌ Scraping returned None")
-            raise Exception("Scraping failed")
-
-        new_count = 0
-        for entry in data:
-            if is_duplicate(entry["id"]):
-                logger.debug(f"⏩ Duplicate skipped: {entry['id']}")
-                continue
-            save_message(
-                entry["id"],
-                entry["number"],
-                entry["otp"],
-                entry["service"],
-                entry["country"],
-                entry.get("country_code", ""),
-                entry["date"],
-                entry["sms"]
-            )
-            append_to_json_log({
-                "id": entry["id"],
-                "number": entry["number"],
-                "otp": entry["otp"],
-                "service": entry["service"],
-                "country": entry["country"],
-                "country_code": entry.get("country_code", ""),
-                "timestamp": entry["date"],
-                "full_message": entry["sms"]
-            })
-            new_count += 1
-            logger.info(f"💾 New OTP stored: {entry['otp']} for {entry['number']}")
-
-        if new_count:
-            logger.info(f"📤 Total {new_count} new OTPs stored.")
-        else:
-            logger.debug("🔄 No new OTPs found.")
-
-    except Exception as e:
-        logger.error(f"❌ Cycle error: {e}")
-        # If page crashed or any other error, restart bot
-        restart_bot()
-        return
-
-    await asyncio.sleep(REFRESH_INTERVAL)
+            
+            retry_count = 0
+            while bot_running:
+                try:
+                    # Navigate to stats page with retry
+                    success = False
+                    for url in STATS_URLS:
+                        try:
+                            await asyncio.wait_for(
+                                page.goto(url, wait_until="domcontentloaded"),
+                                timeout=20.0
+                            )
+                            logger.info(f"✅ Navigated to {url}")
+                            success = True
+                            break
+                        except Exception as e:
+                            logger.warning(f"⏳ Failed to load {url}: {e}")
+                            continue
+                    if not success:
+                        raise Exception("All URLs failed")
+                    
+                    await page.wait_for_timeout(3000)
+                    data = await scrape_sms_stats_from_page(page)
+                    if data is None:
+                        raise Exception("Scraping returned None")
+                    
+                    new_count = 0
+                    for entry in data:
+                        if is_duplicate(entry["id"]):
+                            continue
+                        save_message(
+                            entry["id"],
+                            entry["number"],
+                            entry["otp"],
+                            entry["service"],
+                            entry["country"],
+                            entry.get("country_code", ""),
+                            entry["date"],
+                            entry["sms"]
+                        )
+                        append_to_json_log({
+                            "id": entry["id"],
+                            "number": entry["number"],
+                            "otp": entry["otp"],
+                            "service": entry["service"],
+                            "country": entry["country"],
+                            "country_code": entry.get("country_code", ""),
+                            "timestamp": entry["date"],
+                            "full_message": entry["sms"]
+                        })
+                        new_count += 1
+                        logger.info(f"💾 New OTP stored: {entry['otp']} for {entry['number']}")
+                    if new_count:
+                        logger.info(f"📤 Total {new_count} new OTPs stored.")
+                    else:
+                        logger.debug("🔄 No new OTPs found.")
+                    retry_count = 0
+                    
+                except Exception as e:
+                    logger.error(f"❌ Worker cycle error: {e}")
+                    retry_count += 1
+                    if retry_count >= MAX_RETRIES:
+                        logger.error(f"❌ Too many retries ({retry_count}), restarting worker...")
+                        break
+                    # Recreate page and context
+                    try:
+                        await page.close()
+                    except:
+                        pass
+                    try:
+                        await context.close()
+                    except:
+                        pass
+                    if os.path.exists(COOKIE_FILE):
+                        try:
+                            os.remove(COOKIE_FILE)
+                        except:
+                            pass
+                    context = await create_context(browser)
+                    context = await ensure_logged_in(context, browser)
+                    page = await context.new_page()
+                    await asyncio.sleep(5)
+                    continue
+                
+                await asyncio.sleep(REFRESH_INTERVAL)
+                
+        except Exception as e:
+            logger.error(f"❌ Bot worker fatal error: {e}")
+            await asyncio.sleep(10)
 
 # ================= TELEGRAM HANDLERS =================
 def admin_only(func):
@@ -997,7 +944,6 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         send_func = query.edit_message_text
     else:
         return
-
     keyboard = [
         [InlineKeyboardButton("➕ New Token", callback_data="new_token")],
         [InlineKeyboardButton("📋 List Tokens", callback_data="list_tokens")],
@@ -1008,7 +954,6 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_panel")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     text = (
         f"🤖 <b>API Management Panel</b>\n\n"
         f"📊 Total Tokens: <b>{get_token_count()}</b>\n"
@@ -1223,15 +1168,17 @@ async def ignore_non_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= MAIN =================
 def main():
     init_db()
-    threading.Thread(target=start_api_server, daemon=True).start()
+    
+    # Start API server in a separate daemon thread
+    api_thread = threading.Thread(target=start_api_server, daemon=True)
+    api_thread.start()
     logger.info("🌐 API Server running on http://0.0.0.0:5000")
 
+    # Build Telegram application
     application = Application.builder().token(BOT_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("panel", panel))
     application.add_handler(CommandHandler("stats", stats_text))
-
     application.add_handler(CallbackQueryHandler(new_token_menu, pattern="^new_token$"))
     application.add_handler(CallbackQueryHandler(create_token_callback, pattern="^new_token_(7|30|90|custom)$"))
     application.add_handler(CallbackQueryHandler(list_tokens, pattern="^list_tokens$"))
@@ -1241,31 +1188,24 @@ def main():
     application.add_handler(CallbackQueryHandler(stats_callback, pattern="^stats$"))
     application.add_handler(CallbackQueryHandler(refresh_panel, pattern="^refresh_panel$"))
     application.add_handler(CallbackQueryHandler(panel, pattern="^panel$"))
-
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_token))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_info))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_remove_token))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_enable_token))
-
     application.add_handler(MessageHandler(filters.ALL, ignore_non_admin), group=1)
 
+    # Start bot worker in the same event loop
     loop = asyncio.get_event_loop()
-    loop.create_task(monitor_loop(application))
+    loop.create_task(bot_worker())
 
     logger.info("🚀 Bot started. Press Ctrl+C to stop.")
     try:
         application.run_polling(allowed_updates=Update.ALL_TYPES)
-    except Exception as e:
-        logger.error(f"❌ Bot crashed: {e}")
-        restart_bot()
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot stopped by user")
+    finally:
+        global bot_running
+        bot_running = False
 
 if __name__ == "__main__":
-    while True:
-        try:
-            main()
-        except Exception as e:
-            logger.error(f"❌ Bot crashed: {e}")
-            time.sleep(5)
-            restart_bot()
-        else:
-            break
+    main()
