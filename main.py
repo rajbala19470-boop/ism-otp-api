@@ -829,27 +829,51 @@ def start_api_server():
 
 # ================= MONITOR LOOP =================
 async def monitor_loop(application):
-    playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"]
-    )
-    context = await create_context(browser)
-    context = await ensure_logged_in(context, browser)
-    page = await context.new_page()
+    try:
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"]
+        )
+        context = await create_context(browser)
+        context = await ensure_logged_in(context, browser)
+        page = await context.new_page()
 
-    while True:
-        try:
-            await asyncio.wait_for(
-                _cycle(page, context, browser, application),
-                timeout=TIMEOUT_SECONDS
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"❌ Cycle timed out after {TIMEOUT_SECONDS}s – restarting...")
-            raise
-        except Exception as e:
-            logger.error(f"❌ Monitor loop error: {e}")
-            raise
+        while True:
+            try:
+                await asyncio.wait_for(
+                    _cycle(page, context, browser, application),
+                    timeout=TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"❌ Cycle timed out after {TIMEOUT_SECONDS}s – restarting...")
+                restart_bot()
+                return  # never reached
+            except Exception as e:
+                logger.error(f"❌ Monitor loop error: {e}")
+                # Try to recover
+                try:
+                    await page.close()
+                except:
+                    pass
+                try:
+                    await context.close()
+                except:
+                    pass
+                if os.path.exists(COOKIE_FILE):
+                    try:
+                        os.remove(COOKIE_FILE)
+                    except:
+                        pass
+                # Recreate context and page
+                context = await create_context(browser)
+                context = await ensure_logged_in(context, browser)
+                page = await context.new_page()
+                await asyncio.sleep(2)
+
+    except Exception as e:
+        logger.error(f"❌ Fatal error in monitor_loop: {e}")
+        restart_bot()
 
 async def _cycle(page, context, browser, application):
     try:
@@ -864,44 +888,28 @@ async def _cycle(page, context, browser, application):
             page = await context.new_page()
             return
 
-        # Always refresh/reload the page to get latest data
-        if any(url in current_url for url in STATS_URLS):
+        # Always navigate to stats page to get fresh data
+        if not any(url in current_url for url in STATS_URLS):
+            logger.info("📊 Navigating to SMSCDR Reports page...")
+        else:
             logger.info("🔄 Refreshing page to get latest data...")
+
+        # Use goto instead of reload to avoid crashes
+        for url in STATS_URLS:
             try:
                 await asyncio.wait_for(
-                    page.reload(wait_until="domcontentloaded"),
+                    page.goto(url, wait_until="domcontentloaded"),
                     timeout=20.0
                 )
+                logger.info(f"✅ Navigated to {url}")
+                break
             except asyncio.TimeoutError:
-                logger.warning("⏳ Reload timeout, navigating to URL instead...")
-                # If reload times out, try goto again
-                for url in STATS_URLS:
-                    try:
-                        await asyncio.wait_for(
-                            page.goto(url, wait_until="domcontentloaded"),
-                            timeout=20.0
-                        )
-                        logger.info(f"✅ Navigated to {url}")
-                        break
-                    except:
-                        continue
+                logger.warning(f"⏳ Timeout for {url}, trying next...")
+                continue
         else:
-            # Not on stats page, navigate
-            logger.info("📊 Navigating to SMSCDR Reports page...")
-            for url in STATS_URLS:
-                try:
-                    await asyncio.wait_for(
-                        page.goto(url, wait_until="domcontentloaded"),
-                        timeout=20.0
-                    )
-                    logger.info(f"✅ Navigated to {url}")
-                    break
-                except asyncio.TimeoutError:
-                    logger.warning(f"⏳ Timeout for {url}, trying next...")
-                    continue
-            else:
-                raise Exception("All URLs timed out")
-            await page.wait_for_timeout(3000)
+            raise Exception("All URLs timed out")
+
+        await page.wait_for_timeout(3000)
 
         # Scrape data
         data = await scrape_sms_stats_from_page(page)
@@ -944,21 +952,9 @@ async def _cycle(page, context, browser, application):
 
     except Exception as e:
         logger.error(f"❌ Cycle error: {e}")
-        try:
-            await page.close()
-        except:
-            pass
-        # Try to recover by creating new page and context
-        page = await context.new_page()
-        if os.path.exists(COOKIE_FILE):
-            try:
-                os.remove(COOKIE_FILE)
-            except:
-                pass
-        context = await create_context(browser)
-        context = await ensure_logged_in(context, browser)
-        page = await context.new_page()
-        raise
+        # If page crashed or any other error, restart bot
+        restart_bot()
+        return
 
     await asyncio.sleep(REFRESH_INTERVAL)
 
