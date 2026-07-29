@@ -1,13 +1,12 @@
 import asyncio
 import re
 import os
+import sys
 import json
 import sqlite3
 import logging
 import threading
 import secrets
-import sys
-import time
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -43,16 +42,33 @@ BOT_TOKEN = "8858891566:AAEsH_FfBNTkz5b2g814vxKVxwcO8kOm5AU"
 ADMIN_IDS = [8744359777]
 
 LOGIN_URL = "http://51.75.131.196/ints/login"
-STATS_URLS = [
-    "http://51.75.131.196/ints/agent/SMSCDRReports",
-    "http://51.75.131.196/ints/client/SMSCDRStats"
-]
+STATS_URL = "http://51.75.131.196/ints/agent/SMSCDRReports"
 USERNAME = "rakesh1"
 PASSWORD = "rakesh1"
 
 API_PORT = 5000
-REFRESH_INTERVAL = 3  # seconds
-MAX_RETRIES = 5
+API_HOST = "0.0.0.0"
+REFRESH_INTERVAL = 2
+
+# ================= SELF RESTART SYSTEM =================
+last_success_time = datetime.now()
+RESTART_TIMEOUT = 60  # ৬০ সেকেন্ড = ১ মিনিট
+
+def restart_script():
+    """Script টি রিস্টার্ট করে।"""
+    logger.info("🔄 Script রিস্টার্ট হচ্ছে (inactivity detected)...")
+    time.sleep(2)
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
+
+async def watchdog_task():
+    """চেক করে বট আটকে আছে কিনা, আটকে থাকলে রিস্টার্ট করে।"""
+    global last_success_time
+    while True:
+        await asyncio.sleep(10)  # প্রতি ১০ সেকেন্ডে চেক
+        if (datetime.now() - last_success_time).total_seconds() > RESTART_TIMEOUT:
+            logger.error(f"❌ {RESTART_TIMEOUT} সেকেন্ড ধরে কোনো কার্যকলাপ নেই! রিস্টার্ট হচ্ছে...")
+            restart_script()
 
 # ================= COUNTRY MAP =================
 COUNTRY_CODE_MAP = {
@@ -449,39 +465,41 @@ def extract_otp_from_sms(sms_text):
     if not sms_text:
         return None
     text = ' '.join(sms_text.split())
+    logger.info(f"🔍 Extracting OTP from: {text[:200]}...")
+    
     patterns = [
-        (r'(?:code|otp|pin|verification|auth|security code|one[- ]time|password)\s*(?:is\s*)?[:;.]?\s*#?\s*(\d{4,8})', None),
         (r'#(\d{4,8})\b', None),
+        (r'(?:code|otp|pin|verification|auth|security code|one[- ]time|password)\s*(?:is\s*)?[:;.]?\s*#?\s*(\d{4,8})', None),
+        (r'\b(\d{4,8})\b', None),
         (r'(\d{3})[-—\s](\d{3})', 6),
         (r'(\d{2})[-—\s](\d{3})', 5),
         (r'(\d{3})[-—\s](\d{2})', 5),
         (r'(\d{3})[-—\s](\d{2})[-—\s](\d{2})', 7),
         (r'(\d{4})[-—\s](\d{4})', 8),
         (r'[\(\[]\s*(\d{4,8})\s*[\)\]]', None),
-        (r'\b(\d{4,8})\b', None),
     ]
+    
     for pattern, expected_len in patterns:
         match = re.search(pattern, text, re.I)
         if match:
             if expected_len:
                 digits = ''.join(match.groups())
                 if len(digits) == expected_len and digits.isdigit():
+                    logger.info(f"✅ OTP found: {digits}")
                     return digits
             else:
                 if len(match.groups()) > 1:
                     digits = ''.join(match.groups())
                     if digits.isdigit():
+                        logger.info(f"✅ OTP found: {digits}")
                         return digits
                 else:
                     digits = match.group(1) if match.groups() else match.group(0)
                     if digits.isdigit():
+                        logger.info(f"✅ OTP found: {digits}")
                         return digits
-    fallback = re.search(r'\b(\d{6})\b', text)
-    if fallback:
-        return fallback.group(1)
-    fallback4 = re.search(r'\b(\d{4})\b', text)
-    if fallback4:
-        return fallback4.group(1)
+    
+    logger.info(f"⚠️ No OTP found in: {text[:100]}")
     return None
 
 def detect_service_from_sms(msg):
@@ -504,6 +522,10 @@ def detect_service_from_sms(msg):
         "KUICK": [r'kuick'],
         "Telkom": [r'telkom'],
         "ISM": [r'ism'],
+        "Casushi": [r'casushi'],
+        "Razer": [r'razer'],
+        "Qsms": [r'qsms'],
+        "RedotPay": [r'redotpay'],
     }
     for srv, pats in patterns.items():
         for p in pats:
@@ -511,11 +533,18 @@ def detect_service_from_sms(msg):
                 return srv
     return "UNKNOWN"
 
-# ================= PLAYWRIGHT FUNCTIONS =================
-async def login_and_save_state(page):
+# ================= LOGIN & COOKIE =================
+async def login_and_save_cookie(playwright):
+    browser = await playwright.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"]
+    )
+    context = await browser.new_context()
+    page = await context.new_page()
+
     logger.info("🌐 Opening login page...")
-    await page.goto(LOGIN_URL, wait_until="networkidle")
-    await page.wait_for_timeout(2000)
+    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(1000)
 
     logger.info("✍️ Filling credentials...")
     await page.locator("input[type='text']").first.fill(USERNAME)
@@ -525,150 +554,273 @@ async def login_and_save_state(page):
     captcha_text = await page.locator("body").inner_text()
     match = re.search(r"(\d+)\s*\+\s*(\d+)", captcha_text)
     if not match:
-        raise Exception("❌ Captcha not found")
+        logger.error("❌ Captcha not found")
+        await browser.close()
+        return False
     answer = int(match.group(1)) + int(match.group(2))
     logger.info(f"✅ Captcha answer: {answer}")
     await page.locator("input").last.fill(str(answer))
 
     logger.info("🚀 Clicking login button...")
     await page.locator("button").click()
-
-    logger.info("⏳ Waiting for login redirect (max 15s)...")
-    for i in range(15):
-        await asyncio.sleep(1)
-        current_url = page.url
-        if "login" not in current_url.lower():
-            logger.info(f"✅ Redirected to: {current_url}")
-            break
-    else:
-        raise Exception("❌ Login timeout – still on login page after 15s")
+    await page.wait_for_timeout(5000)
 
     if "login" in page.url.lower():
-        raise Exception("❌ Login failed – still on login page")
+        logger.error("❌ Login failed – still on login page")
+        await browser.close()
+        return False
 
     logger.info("✅ Login successful!")
-    await page.context.storage_state(path=COOKIE_FILE)
-    logger.info("🍪 Cookies saved.")
+    await context.storage_state(path=COOKIE_FILE)
+    logger.info(f"🍪 Cookies saved to {COOKIE_FILE}")
+    await browser.close()
+    return True
 
-async def create_context(browser):
-    if os.path.exists(COOKIE_FILE):
-        logger.info("🍪 Loading saved session...")
-        try:
-            return await browser.new_context(storage_state=COOKIE_FILE)
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to load cookies: {e}, removing and retrying...")
-            os.remove(COOKIE_FILE)
-            return await browser.new_context()
-    else:
-        logger.info("🔑 Creating fresh context...")
-        return await browser.new_context()
+# ================= LOAD STATS =================
+async def load_stats_with_cookie(playwright):
+    global last_success_time
+    
+    if not os.path.exists(COOKIE_FILE):
+        logger.warning("⚠️ Cookie file not found")
+        return False, None
 
-async def ensure_logged_in(context, browser):
+    browser = await playwright.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"]
+    )
+    context = await browser.new_context(storage_state=COOKIE_FILE)
     page = await context.new_page()
+
     try:
-        logger.info("🔍 Checking session...")
-        for url in STATS_URLS:
-            try:
-                await asyncio.wait_for(
-                    page.goto(url, wait_until="domcontentloaded"),
-                    timeout=20.0
-                )
-                if "login" not in page.url.lower():
-                    logger.info("✅ Session valid.")
-                    return context
-            except:
+        logger.info("🔄 Loading Stats page with cookie...")
+        await page.goto(STATS_URL, wait_until="networkidle", timeout=30000)
+        last_success_time = datetime.now()
+        await page.wait_for_timeout(2000)
+
+        html = await page.content()
+        soup = BeautifulSoup(html, 'html.parser')
+        table = soup.select_one('table.dataTable tbody')
+        if not table:
+            table = soup.find('table')
+            if table:
+                table = table.find('tbody')
+            if not table:
+                logger.warning("⚠️ No table found on page. Possibly no data.")
+                await browser.close()
+                return False, None
+
+        rows = table.find_all('tr')
+        total_rows = len(rows)
+        logger.info(f"📊 Found {total_rows} rows in table.")
+
+        if total_rows == 0:
+            logger.info("ℹ️ Table found but no rows. No data yet.")
+            await browser.close()
+            return True, []
+
+        first_row = rows[0]
+        first_cols = first_row.find_all('td')
+        col_count = len(first_cols)
+        logger.info(f"📋 Table has {col_count} columns.")
+
+        if col_count < 7:
+            logger.warning(f"⚠️ Table has only {col_count} columns, expected at least 7")
+            await browser.close()
+            return False, None
+
+        results = []
+        otp_count = 0
+        for row in rows:
+            cols = row.find_all('td')
+            if len(cols) < 7:
                 continue
-        logger.warning("⚠️ Session expired – re‑logging in...")
-        await context.close()
-        new_context = await browser.new_context()
-        new_page = await new_context.new_page()
-        await login_and_save_state(new_page)
-        await new_page.close()
-        return await browser.new_context(storage_state=COOKIE_FILE)
-    finally:
-        await page.close()
-
-async def scrape_sms_stats_from_page(page):
-    try:
-        logger.info("⏳ Waiting for data rows (max 10s)...")
-        await page.wait_for_function(
-            """() => {
-                const rows = document.querySelectorAll('table.dataTable tbody tr');
-                for (let row of rows) {
-                    const firstCell = row.querySelector('td');
-                    if (firstCell) {
-                        const text = firstCell.innerText.trim();
-                        if (/^\\d{4}-\\d{2}-\\d{2}/.test(text)) {
-                            return true;
-                        }
-                    }
-                }
-                return false;
-            }""",
-            timeout=10000,
-            polling=200
-        )
-        logger.info("✅ Data rows loaded.")
-    except Exception as e:
-        logger.warning(f"⏳ Data rows not found within timeout, trying to parse anyway: {e}")
-
-    html = await page.content()
-    soup = BeautifulSoup(html, 'html.parser')
-    table = soup.select_one('table.dataTable tbody')
-    if not table:
-        logger.warning("⚠️ Table body not found – maybe no data yet.")
-        return []
-
-    rows = table.find_all('tr')
-    logger.info(f"📊 Found {len(rows)} rows.")
-    results = []
-    for idx, row in enumerate(rows):
-        cols = row.find_all('td')
-        if len(cols) < 7:
-            continue
-        first = cols[0].get_text(strip=True)
-        if re.match(r'^[\d,]+$', first) or "Total" in first or "Showing" in first:
-            continue
-        try:
+            first = cols[0].get_text(strip=True)
+            if re.match(r'^[\d,]+$', first) or "Total" in first:
+                continue
+            
             date = cols[0].get_text(strip=True)
             range_val = cols[1].get_text(strip=True)
             number = cols[2].get_text(strip=True)
             cli = cols[3].get_text(strip=True)
-            client = cols[4].get_text(strip=True)
-            sms = cols[5].get_text(strip=True) if len(cols) > 5 else ""
-        except IndexError:
-            continue
-        if not sms:
-            continue
-        country = range_val
-        country_code = get_country_code(country)
-        otp = extract_otp_from_sms(sms)
-        if not otp:
-            continue
-        service = "UNKNOWN"
-        if cli and cli.strip() and cli.upper() not in ["UNKNOWN", "SERVICE", ""]:
-            service = cli.strip()
-        elif client and client.strip() and client.upper() not in ["UNKNOWN", "SERVICE", ""]:
-            service = client.strip().lstrip('#')
+            sms = cols[4].get_text(strip=True)
+            
+            logger.info(f"📝 SMS: {sms[:200]}...")
+            
+            country = range_val
+            country_code = get_country_code(country)
+
+            otp = extract_otp_from_sms(sms)
+            if not otp:
+                continue
+
+            otp_count += 1
+            service = "UNKNOWN"
+            if cli and cli.strip() and cli.upper() not in ["UNKNOWN", "SERVICE", ""]:
+                service = cli.strip()
+            else:
+                service = detect_service_from_sms(sms)
+
+            msg_id = f"{date}_{number}_{otp}"
+            results.append({
+                "id": msg_id,
+                "date": date,
+                "country": country,
+                "country_code": country_code,
+                "number": number,
+                "service": service,
+                "sms": sms,
+                "otp": otp
+            })
+
+        if total_rows > 0:
+            logger.info(f"✅ Data Rows Loaded")
+            logger.info(f"🔥 Found {total_rows} Rows")
+            logger.info(f"🔑 Extracted {otp_count} OTPs")
         else:
-            service = detect_service_from_sms(sms)
-        msg_id = f"{date}_{number}_{otp}"
-        results.append({
-            "id": msg_id,
-            "date": date,
-            "country": country,
-            "country_code": country_code,
-            "number": number,
-            "service": service,
-            "sms": sms,
-            "otp": otp
-        })
-        logger.info(f"✅ Row {idx+1}: OTP {otp} for {number} (service: {service})")
-    logger.info(f"✅ Extracted {len(results)} OTP entries from {len(rows)} rows.")
-    return results
+            logger.info("ℹ️ No data rows found")
+
+        last_success_time = datetime.now()
+        await browser.close()
+        return True, results
+
+    except Exception as e:
+        logger.error(f"❌ Error loading with cookie: {e}")
+        try:
+            if "login" in page.url.lower():
+                logger.warning("⚠️ Redirected to login – cookie expired")
+        except:
+            pass
+        await browser.close()
+        return False, None
+
+# ================= MONITOR LOOP =================
+async def monitor_loop(application):
+    global last_success_time
+    
+    playwright = await async_playwright().start()
+
+    if not os.path.exists(COOKIE_FILE):
+        logger.info("🔑 First-time login – creating cookie...")
+        success = await login_and_save_cookie(playwright)
+        if not success:
+            logger.error("❌ Initial login failed. Exiting monitor loop.")
+            return
+        last_success_time = datetime.now()
+
+    consecutive_failures = 0
+    cycle_count = 0
+
+    while True:
+        try:
+            cycle_count += 1
+            logger.info(f"🔄 Monitor cycle #{cycle_count} started...")
+            success, data = await load_stats_with_cookie(playwright)
+
+            if success:
+                consecutive_failures = 0
+                last_success_time = datetime.now()
+                if data and len(data) > 0:
+                    new_count = 0
+                    for entry in data:
+                        if is_duplicate(entry["id"]):
+                            continue
+                        save_message(
+                            entry["id"],
+                            entry["number"],
+                            entry["otp"],
+                            entry["service"],
+                            entry["country"],
+                            entry.get("country_code", ""),
+                            entry["date"],
+                            entry["sms"]
+                        )
+                        append_to_json_log({
+                            "id": entry["id"],
+                            "number": entry["number"],
+                            "otp": entry["otp"],
+                            "service": entry["service"],
+                            "country": entry["country"],
+                            "country_code": entry.get("country_code", ""),
+                            "timestamp": entry["date"],
+                            "full_message": entry["sms"]
+                        })
+                        new_count += 1
+                        logger.info(f"💾 New OTP stored: {entry['otp']} for {entry['number']}")
+                    if new_count:
+                        logger.info(f"📤 Total {new_count} new OTPs stored.")
+                    else:
+                        logger.info("🔄 No new OTPs found.")
+                else:
+                    logger.info("🔄 No OTPs found, checking again...")
+            else:
+                consecutive_failures += 1
+                logger.warning(f"⚠️ Cookie load failed ({consecutive_failures} consecutive)")
+
+                if consecutive_failures >= 3:
+                    logger.info("🔄 Re-login triggered (3 consecutive failures)...")
+                    if os.path.exists(COOKIE_FILE):
+                        os.remove(COOKIE_FILE)
+                    success = await login_and_save_cookie(playwright)
+                    if success:
+                        logger.info("✅ New cookie created.")
+                        last_success_time = datetime.now()
+                        consecutive_failures = 0
+                    else:
+                        logger.error("❌ Re-login failed. Will retry later.")
+
+            logger.info("🕛 Waiting for OTPs...")
+            await asyncio.sleep(REFRESH_INTERVAL)
+
+        except Exception as e:
+            logger.error(f"❌ Monitor loop error: {e}")
+            consecutive_failures += 1
+            if consecutive_failures >= 3:
+                logger.warning("⚠️ Too many errors, attempting to recreate cookie...")
+                if os.path.exists(COOKIE_FILE):
+                    os.remove(COOKIE_FILE)
+                await login_and_save_cookie(playwright)
+                last_success_time = datetime.now()
+                consecutive_failures = 0
+            await asyncio.sleep(REFRESH_INTERVAL)
 
 # ================= API SERVER =================
 api_app = Flask(__name__)
+
+@api_app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({"status": "ok", "message": "API is running!"})
+
+@api_app.route('/all_otp', methods=['GET'])
+def all_otp_api():
+    token = request.args.get('token')
+    if not token:
+        return jsonify({"status": "error", "error": "missing_token", "message": "Token required"}), 400
+    info = get_token_info(token)
+    if not info or info["is_active"] != 1 or info["expires_at"] < datetime.now().strftime("%Y-%m-%d %H:%M:%S"):
+        return jsonify({"status": "error", "error": "invalid_token", "message": "Invalid or expired token"}), 401
+    try:
+        rows = get_all_otps(50)
+        if not rows:
+            return jsonify({"status": "success", "Sms": "No OTPs found", "data": {"total": 0, "otps": []}})
+        formatted = []
+        for row in rows:
+            formatted.append({
+                "number": row.get("number", ""),
+                "otp": row.get("otp", ""),
+                "timestamp": row.get("timestamp", ""),
+                "service": row.get("service", "UNKNOWN"),
+                "country": row.get("country", "Unknown"),
+                "country_code": row.get("country_code", ""),
+                "message": row.get("full_message", "")
+            })
+        return jsonify({
+            "status": "success",
+            "Sms": f"Found {len(formatted)} recent OTPs",
+            "data": {"total": len(formatted), "otps": formatted}
+        })
+    except Exception as e:
+        logger.error(f"❌ Error in /all_otp: {e}")
+        return jsonify({"status": "error", "error": "internal_error", "message": str(e)}), 500
 
 @api_app.route('/get_otp', methods=['GET'])
 def get_otp_api():
@@ -720,45 +872,6 @@ def latest_otp_api():
         }
     })
 
-@api_app.route('/all_otp', methods=['GET'])
-def all_otp_api():
-    token = request.args.get('token')
-    if not token:
-        return jsonify({"status": "error", "error": "missing_token", "message": "Token required"}), 400
-    info = get_token_info(token)
-    if not info or info["is_active"] != 1 or info["expires_at"] < datetime.now().strftime("%Y-%m-%d %H:%M:%S"):
-        return jsonify({"status": "error", "error": "invalid_token", "message": "Invalid or expired token"}), 401
-    try:
-        rows = get_all_otps(50)
-        if not rows:
-            return jsonify({
-                "status": "success",
-                "Sms": "No OTPs found",
-                "data": {"total": 0, "otps": []}
-            })
-        formatted = []
-        for row in rows:
-            formatted.append({
-                "number": row.get("number", ""),
-                "otp": row.get("otp", ""),
-                "timestamp": row.get("timestamp", ""),
-                "service": row.get("service", "UNKNOWN"),
-                "country": row.get("country", "Unknown"),
-                "country_code": row.get("country_code", ""),
-                "message": row.get("full_message", "")
-            })
-        return jsonify({
-            "status": "success",
-            "Sms": f"Found {len(formatted)} recent OTPs",
-            "data": {
-                "total": len(formatted),
-                "otps": formatted
-            }
-        })
-    except Exception as e:
-        logger.error(f"❌ Error in /all_otp: {e}")
-        return jsonify({"status": "error", "error": "internal_error", "message": str(e)}), 500
-
 @api_app.route('/stats', methods=['GET'])
 def api_stats():
     token = request.args.get('token')
@@ -797,113 +910,8 @@ def check_token_api():
     })
 
 def start_api_server():
-    api_app.run(host="0.0.0.0", port=API_PORT, debug=False, use_reloader=False)
-
-# ================= BOT WORKER =================
-bot_running = True
-
-async def bot_worker():
-    global bot_running
-    while bot_running:
-        try:
-            logger.info("🚀 Starting bot worker...")
-            playwright = await async_playwright().start()
-            browser = await playwright.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"]
-            )
-            context = await create_context(browser)
-            context = await ensure_logged_in(context, browser)
-            page = await context.new_page()
-            
-            retry_count = 0
-            while bot_running:
-                try:
-                    # Navigate to stats page with retry
-                    success = False
-                    for url in STATS_URLS:
-                        try:
-                            await asyncio.wait_for(
-                                page.goto(url, wait_until="domcontentloaded"),
-                                timeout=20.0
-                            )
-                            logger.info(f"✅ Navigated to {url}")
-                            success = True
-                            break
-                        except Exception as e:
-                            logger.warning(f"⏳ Failed to load {url}: {e}")
-                            continue
-                    if not success:
-                        raise Exception("All URLs failed")
-                    
-                    await page.wait_for_timeout(3000)
-                    data = await scrape_sms_stats_from_page(page)
-                    if data is None:
-                        raise Exception("Scraping returned None")
-                    
-                    new_count = 0
-                    for entry in data:
-                        if is_duplicate(entry["id"]):
-                            continue
-                        save_message(
-                            entry["id"],
-                            entry["number"],
-                            entry["otp"],
-                            entry["service"],
-                            entry["country"],
-                            entry.get("country_code", ""),
-                            entry["date"],
-                            entry["sms"]
-                        )
-                        append_to_json_log({
-                            "id": entry["id"],
-                            "number": entry["number"],
-                            "otp": entry["otp"],
-                            "service": entry["service"],
-                            "country": entry["country"],
-                            "country_code": entry.get("country_code", ""),
-                            "timestamp": entry["date"],
-                            "full_message": entry["sms"]
-                        })
-                        new_count += 1
-                        logger.info(f"💾 New OTP stored: {entry['otp']} for {entry['number']}")
-                    if new_count:
-                        logger.info(f"📤 Total {new_count} new OTPs stored.")
-                    else:
-                        logger.debug("🔄 No new OTPs found.")
-                    retry_count = 0
-                    
-                except Exception as e:
-                    logger.error(f"❌ Worker cycle error: {e}")
-                    retry_count += 1
-                    if retry_count >= MAX_RETRIES:
-                        logger.error(f"❌ Too many retries ({retry_count}), restarting worker...")
-                        break
-                    # Recreate page and context
-                    try:
-                        await page.close()
-                    except:
-                        pass
-                    try:
-                        await context.close()
-                    except:
-                        pass
-                    if os.path.exists(COOKIE_FILE):
-                        try:
-                            os.remove(COOKIE_FILE)
-                        except:
-                            pass
-                    context = await create_context(browser)
-                    context = await ensure_logged_in(context, browser)
-                    page = await context.new_page()
-                    await asyncio.sleep(5)
-                    continue
-                
-                await asyncio.sleep(REFRESH_INTERVAL)
-                
-        except Exception as e:
-            logger.error(f"❌ Bot worker fatal error: {e}")
-            await asyncio.sleep(10)
+    logger.info(f"🚀 Starting API server on {API_HOST}:{API_PORT}...")
+    api_app.run(host=API_HOST, port=API_PORT, debug=False, use_reloader=False)
 
 # ================= TELEGRAM HANDLERS =================
 def admin_only(func):
@@ -944,6 +952,7 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         send_func = query.edit_message_text
     else:
         return
+
     keyboard = [
         [InlineKeyboardButton("➕ New Token", callback_data="new_token")],
         [InlineKeyboardButton("📋 List Tokens", callback_data="list_tokens")],
@@ -954,6 +963,7 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_panel")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+
     text = (
         f"🤖 <b>API Management Panel</b>\n\n"
         f"📊 Total Tokens: <b>{get_token_count()}</b>\n"
@@ -1168,17 +1178,17 @@ async def ignore_non_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= MAIN =================
 def main():
     init_db()
-    
-    # Start API server in a separate daemon thread
-    api_thread = threading.Thread(target=start_api_server, daemon=True)
-    api_thread.start()
-    logger.info("🌐 API Server running on http://0.0.0.0:5000")
+    threading.Thread(target=start_api_server, daemon=True).start()
+    import time
+    time.sleep(1)
+    logger.info(f"🌐 API Server running on http://{API_HOST}:{API_PORT}")
 
-    # Build Telegram application
     application = Application.builder().token(BOT_TOKEN).build()
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("panel", panel))
     application.add_handler(CommandHandler("stats", stats_text))
+
     application.add_handler(CallbackQueryHandler(new_token_menu, pattern="^new_token$"))
     application.add_handler(CallbackQueryHandler(create_token_callback, pattern="^new_token_(7|30|90|custom)$"))
     application.add_handler(CallbackQueryHandler(list_tokens, pattern="^list_tokens$"))
@@ -1188,24 +1198,20 @@ def main():
     application.add_handler(CallbackQueryHandler(stats_callback, pattern="^stats$"))
     application.add_handler(CallbackQueryHandler(refresh_panel, pattern="^refresh_panel$"))
     application.add_handler(CallbackQueryHandler(panel, pattern="^panel$"))
+
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_token))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_info))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_remove_token))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_enable_token))
+
     application.add_handler(MessageHandler(filters.ALL, ignore_non_admin), group=1)
 
-    # Start bot worker in the same event loop
     loop = asyncio.get_event_loop()
-    loop.create_task(bot_worker())
+    loop.create_task(monitor_loop(application))
+    loop.create_task(watchdog_task())  # 🚀 সেলফ রিস্টার্ট ওয়াচডগ
 
     logger.info("🚀 Bot started. Press Ctrl+C to stop.")
-    try:
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-    except KeyboardInterrupt:
-        logger.info("🛑 Bot stopped by user")
-    finally:
-        global bot_running
-        bot_running = False
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
